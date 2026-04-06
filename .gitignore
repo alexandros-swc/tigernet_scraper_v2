@@ -1,0 +1,30 @@
+# Credentials
+.env
+
+# Output data
+output/
+*.csv
+
+# Token cache
+.token_cache.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Playwright
+playwright-report/
+test-results/
