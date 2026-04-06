@@ -18,8 +18,7 @@ import sys
 import os
 
 from src.auth import authenticate
-from src.scraper import scrape_directory
-from src.profile import fetch_all_full_profiles
+from src.scraper import scrape_directory, fetch_full_profiles
 from src.exporter import export_to_csv
 from src.utils import setup_logging, load_progress, save_progress
 from config.settings import Settings
@@ -105,7 +104,7 @@ def main():
     # Step 3: Optionally fetch full profiles
     if args.full_profiles:
         logger.info("Step 3: Fetching full profile details...")
-        users = fetch_all_full_profiles(
+        users = fetch_full_profiles(
             tokens=tokens,
             users=users,
             settings=settings,
