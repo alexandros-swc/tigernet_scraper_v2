@@ -187,25 +187,151 @@ def _browser_login(headless: bool) -> dict | None:
             )
             logger.info("Duo approved! Logged into TigerNet.")
 
-            # Step 4: Extract cookies and CSRF token
+            # Step 6: Wait for the page to fully initialize and set tokens
+            # The Hivebrite SPA needs a moment to set API tokens after login
+            logger.info("Waiting for page to fully initialize...")
+            time.sleep(5)
+
+            # Step 7: Extract cookies
             cookies_list = context.cookies()
             cookies = {}
             for c in cookies_list:
-                if c["name"] in REQUIRED_COOKIES:
-                    cookies[c["name"]] = c["value"]
+                cookies[c["name"]] = c["value"]
 
-            # Get CSRF token from the page's meta tag or by making an API call
-            csrf_token = _extract_csrf_token(page)
+            # Log which auth-related cookies we found
+            auth_cookie_names = [
+                n for n in cookies
+                if any(k in n.lower() for k in ["token", "session", "hivebrite", "clearance", "cf_", "xsrf"])
+            ]
+            logger.info(f"Found {len(cookies)} cookies, auth-related: {auth_cookie_names}")
 
-            # Extract user ID from the JWT access token
-            my_user_id = _extract_user_id_from_jwt(
-                cookies.get("api_access_token", "")
-            )
+            # Step 8: Get CSRF token from cookies (Hivebrite uses XSRF-TOKEN cookie)
+            csrf_token = cookies.get("XSRF-TOKEN", "")
+            if csrf_token:
+                from urllib.parse import unquote
+                csrf_token = unquote(csrf_token)
+                logger.info("Got CSRF token from XSRF-TOKEN cookie.")
+            else:
+                csrf_token = _extract_csrf_token(page)
+
+            # Step 9: Try to get API access token from localStorage or by making an API call
+            access_token = cookies.get("api_access_token", "")
+
+            if not access_token:
+                # Hivebrite may store the token in localStorage
+                logger.info("No api_access_token cookie. Checking localStorage...")
+                try:
+                    access_token = page.evaluate(
+                        """() => {
+                            return localStorage.getItem('api_access_token')
+                                || localStorage.getItem('access_token')
+                                || localStorage.getItem('token')
+                                || null;
+                        }"""
+                    ) or ""
+                    if access_token:
+                        logger.info("Found access token in localStorage.")
+                except Exception:
+                    pass
+
+            # Step 10: Get user ID — try multiple approaches
+            my_user_id = None
+
+            # Approach 1: Decode JWT if we have an access token
+            if access_token:
+                from urllib.parse import unquote
+                access_token = unquote(access_token)
+                my_user_id = _extract_user_id_from_jwt(access_token)
+
+            # Approach 2: Make an API call from the browser to get user info
+            if not my_user_id:
+                logger.info("Trying to get user ID via API call from browser...")
+                try:
+                    user_data = page.evaluate(
+                        """async () => {
+                            // Try the header_data endpoint which should have user info
+                            try {
+                                const resp = await fetch('/frontoffice/api/header_data', {
+                                    headers: {'Accept': 'application/json'}
+                                });
+                                if (resp.ok) {
+                                    const data = await resp.json();
+                                    return JSON.stringify(data);
+                                }
+                            } catch(e) {}
+
+                            // Try session_info
+                            try {
+                                const resp = await fetch('/frontoffice/api/session_info.json?type=user', {
+                                    headers: {'Accept': 'application/json'}
+                                });
+                                if (resp.ok) {
+                                    const data = await resp.json();
+                                    return JSON.stringify(data);
+                                }
+                            } catch(e) {}
+
+                            // Try users endpoint with per_page=1
+                            try {
+                                const resp = await fetch('/frontoffice/api/users?page=1&per_page=1', {
+                                    headers: {'Accept': 'application/json'}
+                                });
+                                if (resp.ok) {
+                                    const data = await resp.json();
+                                    return JSON.stringify({_source: 'users_endpoint', ...data});
+                                }
+                            } catch(e) {}
+
+                            return null;
+                        }"""
+                    )
+                    if user_data:
+                        data = json.loads(user_data)
+                        logger.info(f"API response keys: {list(data.keys())}")
+                        # Try to find user ID in various response shapes
+                        my_user_id = str(
+                            data.get("user_id")
+                            or data.get("id")
+                            or data.get("user", {}).get("id") if isinstance(data.get("user"), dict) else None
+                            or data.get("current_user", {}).get("id") if isinstance(data.get("current_user"), dict) else None
+                        )
+                        if my_user_id in ("None", ""):
+                            my_user_id = None
+                        if my_user_id:
+                            logger.info(f"Got user ID from API: {my_user_id}")
+                except Exception as e:
+                    logger.warning(f"API fallback failed: {e}")
+
+            # Approach 3: Navigate to profile page and extract ID from URL
+            if not my_user_id:
+                logger.info("Trying to get user ID from profile page...")
+                try:
+                    page.click("a:has-text('Profile'), a:has-text('My Profile')", timeout=5000)
+                    time.sleep(3)
+                    url = page.url
+                    logger.info(f"Profile page URL: {url}")
+                    # URL might be like /users/7597137
+                    import re
+                    match = re.search(r'/users/(\d+)', url)
+                    if match:
+                        my_user_id = match.group(1)
+                        logger.info(f"Got user ID from profile URL: {my_user_id}")
+                except Exception as e:
+                    logger.warning(f"Profile URL fallback failed: {e}")
 
             if not my_user_id:
-                logger.error("Could not extract user ID from access token.")
-                return None
+                logger.error(
+                    "Could not extract user ID automatically. "
+                    "Please set MY_USER_ID in your .env file. "
+                    "You can find it by going to your TigerNet profile — "
+                    "the number in the URL (e.g., /users/7597137) is your ID."
+                )
+                # Check env var as ultimate fallback
+                my_user_id = os.getenv("MY_USER_ID")
+                if not my_user_id:
+                    return None
 
+            # Keep all cookies (the session cookies are what matter for API access)
             tokens = {
                 "cookies": cookies,
                 "csrf_token": csrf_token,
@@ -341,3 +467,44 @@ def _save_cached_tokens(tokens: dict) -> None:
         logger.info("Saved tokens to cache.")
     except Exception as e:
         logger.warning(f"Could not cache tokens: {e}")
+
+
+def restore_browser_session(playwright_instance, tokens: dict, settings=None):
+    """
+    Open a Playwright browser and restore the authenticated session
+    by injecting cookies. Returns (browser, page) tuple.
+
+    This allows making API calls from inside the browser context,
+    which properly handles Cloudflare and all cookie/header requirements.
+    """
+    browser = playwright_instance.chromium.launch(headless=True)
+    context = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/146.0.0.0 Safari/537.36"
+        )
+    )
+
+    # Inject all cookies into the browser context
+    cookies = tokens.get("cookies", {})
+    cookie_list = []
+    for name, value in cookies.items():
+        cookie_list.append({
+            "name": name,
+            "value": value,
+            "domain": "tigernet.princeton.edu",
+            "path": "/",
+        })
+
+    if cookie_list:
+        context.add_cookies(cookie_list)
+        logger.info(f"Injected {len(cookie_list)} cookies into browser context.")
+
+    # Navigate to TigerNet so the browser is on the right origin for fetch() calls
+    page = context.new_page()
+    page.goto("https://tigernet.princeton.edu/my-homepage", wait_until="domcontentloaded", timeout=30000)
+    time.sleep(2)
+
+    logger.info(f"Browser session restored. Current URL: {page.url}")
+    return browser, page

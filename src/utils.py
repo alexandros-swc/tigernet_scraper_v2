@@ -41,9 +41,17 @@ def make_session(tokens: dict) -> requests.Session:
     """
     session = requests.Session()
 
-    # Set headers to mimic the browser
+    cookies = tokens.get("cookies", {})
+    csrf = tokens.get("csrf_token", "")
+
+    # Build the Cookie header string manually — this avoids domain-matching
+    # issues that cause requests to silently drop cookies
+    cookie_string = "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+    # Set headers to mimic the browser exactly
     session.headers.update({
         "Accept": "application/json, text/plain, */*",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
         "Accept-Language": "en-US,en;q=0.9",
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -52,17 +60,21 @@ def make_session(tokens: dict) -> requests.Session:
         ),
         "x-requested-with": "XMLHttpRequest",
         "Referer": "https://tigernet.princeton.edu/people",
+        "Origin": "https://tigernet.princeton.edu",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "Cookie": cookie_string,
     })
 
-    # Add CSRF token if available
-    csrf = tokens.get("csrf_token")
+    # Add CSRF token
     if csrf:
         session.headers["x-csrf-token"] = csrf
 
-    # Set cookies
-    cookies = tokens.get("cookies", {})
-    for name, value in cookies.items():
-        session.cookies.set(name, value, domain="tigernet.princeton.edu")
+    logger.info(
+        f"Session configured with {len(cookies)} cookies, "
+        f"CSRF token: {'yes' if csrf else 'no'}"
+    )
 
     return session
 
@@ -114,15 +126,25 @@ def retry_request(
             # Server error — retry
             if resp.status_code >= 500:
                 wait = settings.retry_backoff_base ** attempt
+                # Log response body for debugging
+                try:
+                    body_preview = resp.text[:500]
+                except Exception:
+                    body_preview = "(could not read body)"
                 logger.warning(
                     f"Server error ({resp.status_code}) on attempt {attempt}. "
+                    f"Body: {body_preview}. "
                     f"Retrying in {wait:.0f}s..."
                 )
                 time.sleep(wait)
                 continue
 
             # Other client errors
-            logger.error(f"Request failed: {resp.status_code} — {url}")
+            try:
+                body_preview = resp.text[:500]
+            except Exception:
+                body_preview = "(could not read body)"
+            logger.error(f"Request failed: {resp.status_code} — {url} — Body: {body_preview}")
             return None
 
         except requests.exceptions.Timeout:
