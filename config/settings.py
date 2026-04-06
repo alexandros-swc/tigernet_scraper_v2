@@ -17,12 +17,12 @@ class Settings:
     profile_endpoint_template: str = "/users/{my_user_id}/users/{target_user_id}"
 
     # Pagination
-    per_page: int = 50
+    per_page: int = 100
     max_pages: int | None = None
 
     # Rate limiting (seconds between requests)
-    request_delay: float = 1.5
-    listing_delay: float = 1.0  # Faster for listing pages (lighter endpoint)
+    request_delay: float = 0.2
+    listing_delay: float = 0.3  # Faster for listing pages (lighter endpoint)
 
     # Retry settings
     max_retries: int = 3

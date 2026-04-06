@@ -47,8 +47,8 @@ def parse_args():
     parser.add_argument(
         "--per-page",
         type=int,
-        default=50,
-        help="Number of results per page (default: 50, max may vary)",
+        default=None,
+        help="Number of results per page (default: 100, max may vary)",
     )
     parser.add_argument(
         "--output",
@@ -67,11 +67,13 @@ def parse_args():
 def main():
     args = parse_args()
     settings = Settings(
-        per_page=args.per_page,
         max_pages=args.max_pages,
         output_path=args.output,
         headless=args.headless,
     )
+    # Only override per_page if explicitly passed on command line
+    if args.per_page is not None:
+        settings.per_page = args.per_page
 
     setup_logging()
     logger = logging.getLogger(__name__)
