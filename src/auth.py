@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import base64
+import time
 
 from dotenv import load_dotenv
 
@@ -91,18 +92,89 @@ def _browser_login(headless: bool) -> dict | None:
         page = context.new_page()
 
         try:
-            # Step 1: Navigate to TigerNet — triggers CAS redirect
+            # Step 1: Navigate to TigerNet
             logger.info("Navigating to TigerNet...")
-            page.goto("https://tigernet.princeton.edu", timeout=30000)
+            page.goto("https://tigernet.princeton.edu", wait_until="domcontentloaded", timeout=30000)
+            # Give the page time to fully render (JS, cookie banner, etc.)
+            time.sleep(5)
 
-            # Step 2: Fill CAS login form
-            logger.info("Filling CAS login form...")
-            page.wait_for_selector("#username", timeout=15000)
+            # Step 2: Dismiss cookie consent banner — MUST happen before Login click
+            logger.info("Looking for cookie consent banner...")
+            cookie_dismissed = False
+            for cookie_selector in [
+                "button:has-text('Accept all cookies')",
+                "text=Accept all cookies",
+                "button:has-text('Accept')",
+                "button.accept-all",
+                "[data-testid='cookie-accept']",
+                "button:has-text('Reject all')",  # Either option dismisses it
+                "button.css-1litn2c",  # Generic button class fallback
+            ]:
+                try:
+                    btn = page.locator(cookie_selector).first
+                    if btn.is_visible(timeout=2000):
+                        logger.info(f"Dismissing cookie banner via: {cookie_selector}")
+                        btn.click()
+                        cookie_dismissed = True
+                        time.sleep(2)
+                        break
+                except Exception:
+                    continue
+
+            if not cookie_dismissed:
+                # Try clicking the X close button on the banner
+                try:
+                    close_btn = page.locator("button[aria-label='Close'], .close-btn, button:has-text('×')").first
+                    if close_btn.is_visible(timeout=2000):
+                        logger.info("Closing cookie banner via X button...")
+                        close_btn.click()
+                        cookie_dismissed = True
+                        time.sleep(2)
+                except Exception:
+                    pass
+
+            if not cookie_dismissed:
+                logger.warning("Could not dismiss cookie banner. Trying to proceed anyway...")
+
+            # Step 3: Click the Login button on the TigerNet landing page
+            logger.info("Clicking Login button...")
+            login_clicked = False
+            for selector in [
+                "a:has-text('Login')",
+                "button:has-text('Login')",
+                "a:has-text('Log in')",
+                "button:has-text('Log in')",
+                "text=Login",
+                "text=Log in",
+            ]:
+                try:
+                    btn = page.locator(selector).first
+                    if btn.is_visible(timeout=3000):
+                        btn.click()
+                        login_clicked = True
+                        logger.info(f"Clicked login button via: {selector}")
+                        break
+                except Exception:
+                    continue
+
+            if not login_clicked:
+                # Last resort: navigate directly to CAS login URL
+                logger.info("Login button not found. Navigating directly to CAS...")
+                page.goto(
+                    "https://tigernet.princeton.edu/cas/auth",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+
+            # Step 4: Wait for CAS login form to appear and fill it
+            logger.info("Waiting for CAS login form...")
+            page.wait_for_selector("#username", timeout=30000)
+            logger.info("Filling CAS credentials...")
             page.fill("#username", netid)
             page.fill("#password", password)
             page.click('button[type="submit"], input[type="submit"]')
 
-            # Step 3: Wait for Duo MFA
+            # Step 5: Wait for Duo MFA
             logger.info(
                 "Waiting for Duo MFA approval... "
                 "Please approve the push notification on your phone."
