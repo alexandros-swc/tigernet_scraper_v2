@@ -2,13 +2,46 @@
 CSV exporter.
 
 Flattens nested JSON profile data into a clean CSV with one row per alumni.
-Dynamically discovers all fields — nothing is hardcoded.
+
+IMPORTANT: No hardcoded field lists. Every field in the API response is captured
+dynamically. Known fields get friendly column names, but unknown/new fields
+are included automatically with auto-generated names.
 """
 
 import csv
 import logging
+import re
 
 logger = logging.getLogger(__name__)
+
+# Fields to skip — internal metadata, redundant photo variants, permissions, etc.
+SKIP_FIELDS = {
+    "new_photo", "new_cover_picture",  # Redundant photo URL variants
+    "cover_picture_url", "cover_picture_medium_url", "cover_picture_is_default",
+    "photo_is_default", "photo_medium_url",
+    "guid", "locale", "timezone",  # Internal metadata
+    "signup_payment_required", "landing_page_path", "welcome_page_path",
+    "total_unread_messages", "users_can_create_events", "user_can_access_events",
+    "can_create_forum_post", "can_access_forum", "can_invite_users",
+    "profile_is_editable", "can", "journeys_rights", "user_targeting",
+    "primary_email_choice", "default_billing_address_type",
+    "has_introduction", "can_message_user", "can_access_to_contact", "cant_access_message",
+}
+
+# Priority columns — these appear first in the CSV (if present)
+PRIORITY_COLUMNS = [
+    "id", "full_name", "firstname", "lastname", "prefix_name",
+    "suffix_name", "maidenname", "class_year", "degree_type", "deceased",
+    "headline", "email", "email2", "email3",
+    "mobile_perso", "mobile_pro", "landline_perso", "landline_pro",
+    "current_job", "company_name",
+    "city", "state", "country", "postal_code", "address",
+    "linkedin_profile_url", "instagram_profile_url",
+    "facebook_profile_url", "twitter", "website", "skype",
+    "preferred_paa", "affinity_groups", "sub_networks",
+    "educations", "experiences", "skills", "industries",
+    "awards", "birthday", "birthplace", "photo_url",
+]
 
 
 def export_to_csv(users: list[dict], output_path: str, full_profiles: bool = False) -> None:
@@ -25,29 +58,13 @@ def export_to_csv(users: list[dict], output_path: str, full_profiles: bool = Fal
         flat_users.append(flat)
         all_keys.update(flat.keys())
 
-    # Priority columns first, then alphabetical
-    priority_cols = [
-        "id", "full_name", "firstname", "lastname", "prefix_name",
-        "suffix_name", "maidenname", "class_year", "degree_type", "deceased",
-        "headline", "email", "email2", "email3",
-        "mobile_perso", "mobile_pro", "landline_perso", "landline_pro",
-        "current_job", "company_name",
-        "city", "state", "country", "postal_code", "address",
-        "linkedin_profile_url", "instagram_profile_url",
-        "facebook_profile_url", "twitter", "website",
-        "preferred_paa", "affinity_groups", "sub_networks",
-        "educations", "experiences", "skills", "industries",
-        "awards", "birthday", "photo_url",
-    ]
-
-    ordered_cols = [c for c in priority_cols if c in all_keys]
-    remaining = sorted(all_keys - set(ordered_cols))
-    fieldnames = ordered_cols + remaining
+    # Order columns: priority first, then alphabetical
+    ordered = [c for c in PRIORITY_COLUMNS if c in all_keys]
+    remaining = sorted(all_keys - set(ordered))
+    fieldnames = ordered + remaining
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=fieldnames, restval="", extrasaction="ignore",
-        )
+        writer = csv.DictWriter(f, fieldnames=fieldnames, restval="", extrasaction="ignore")
         writer.writeheader()
         writer.writerows(flat_users)
 
@@ -58,29 +75,26 @@ def _flatten_user(user: dict, full_profiles: bool) -> dict:
     """Flatten a single user dict into a flat key-value structure."""
     flat = {}
 
-    # ---- Basic scalar fields (from listing) ----
-    for key in [
-        "id", "firstname", "lastname", "prefix_name", "suffix_name",
-        "maidenname", "headline", "deceased", "confirmed",
-        "last_seen_at", "honorary_title",
-    ]:
-        if key in user:
-            flat[key] = _clean(user.get(key))
+    # ---- Dynamically capture all top-level scalar fields from listing ----
+    for key, val in user.items():
+        if key in SKIP_FIELDS:
+            continue
+        if key in ("fields", "photo", "last_location", "full_profile"):
+            continue  # Handled specially below
+        if isinstance(val, (str, int, float, bool)) or val is None:
+            flat[key] = _clean(val)
 
-    # ---- Custom fields array (from listing) ----
+    # ---- Custom fields array (from listing) — fully dynamic ----
     for field in user.get("fields", []):
         display_name = field.get("display_name", "")
         value = field.get("value")
+        col = _col_name(display_name)
 
         if display_name == "Full Name":
             flat["full_name"] = _clean(value)
             flat["class_year"] = _extract_class_year(value or "")
-        elif display_name == "Preferred PAA":
-            flat["preferred_paa"] = _join(value)
-        elif display_name == "Affinity Groups":
-            flat["affinity_groups"] = _join(value)
         else:
-            flat[_col_name(display_name)] = _join(value) if isinstance(value, list) else _clean(value)
+            flat[col] = _join(value) if isinstance(value, list) else _clean(value)
 
     # ---- Location (from listing) ----
     loc = user.get("last_location")
@@ -108,29 +122,31 @@ def _flatten_user(user: dict, full_profiles: bool) -> dict:
 
 
 def _flatten_full_profile(p: dict, flat: dict) -> None:
-    """Merge all full-profile fields into the flat dict."""
+    """
+    Dynamically flatten all full-profile fields.
+    
+    Scalar values are captured directly. Known nested structures 
+    (educations, experiences, etc.) get special formatting.
+    Anything unknown is still captured.
+    """
 
-    # --- Scalar contact / social fields ---
-    for key in [
-        "email", "email2", "email3",
-        "mobile_pro", "mobile_perso",
-        "landline_pro", "landline_perso",
-        "current_job", "company_name",
-        "linkedin_profile_url", "instagram_profile_url",
-        "facebook_profile_url", "twitter", "website", "skype", "bbm",
-        "birthday", "birthplace",
-        "awards", "industry_name",
-        "name", "headline",
-    ]:
-        val = p.get(key)
+    # --- Pass 1: Capture ALL scalar fields dynamically ---
+    for key, val in p.items():
+        if key in SKIP_FIELDS:
+            continue
+        # Skip nested structures — handled in Pass 2
+        if isinstance(val, (dict, list)):
+            continue
         if val is not None and val != "":
             flat[key] = _clean(val)
 
-    # --- Full name from profile (overrides listing if present) ---
+    # Override full_name from profile if present
     if p.get("name"):
         flat["full_name"] = _clean(p["name"])
 
-    # --- Location (richer than listing version) ---
+    # --- Pass 2: Handle known nested structures with nice formatting ---
+
+    # Location (richer than listing)
     locations = p.get("locations", [])
     if locations:
         loc = locations[0]
@@ -145,19 +161,18 @@ def _flatten_full_profile(p: dict, flat: dict) -> None:
         flat["lat"] = _clean(loc.get("lat"))
         flat["lng"] = _clean(loc.get("lng"))
 
-    # --- Postal addresses ---
+    # Postal addresses
     postal = p.get("postal_address", {})
-    for addr_type in ("work", "personal"):
-        addr = postal.get(addr_type, {})
-        if addr and any(addr.get(k) for k in ("address_1", "city", "postal_code", "country")):
-            prefix = f"postal_{addr_type}"
-            flat[f"{prefix}_address"] = _clean(addr.get("address_1"))
-            flat[f"{prefix}_city"] = _clean(addr.get("city"))
-            flat[f"{prefix}_state"] = _clean(addr.get("state"))
-            flat[f"{prefix}_postal_code"] = _clean(addr.get("postal_code"))
-            flat[f"{prefix}_country"] = _clean(addr.get("country"))
+    if isinstance(postal, dict):
+        for addr_type in ("work", "personal"):
+            addr = postal.get(addr_type, {})
+            if isinstance(addr, dict) and any(addr.get(k) for k in addr):
+                prefix = f"postal_{addr_type}"
+                for ak, av in addr.items():
+                    if av is not None and av != "":
+                        flat[f"{prefix}_{ak}"] = _clean(av)
 
-    # --- Education ---
+    # Education — dynamic attribute extraction
     educations = p.get("educations", [])
     edu_rows = []
     for edu in educations:
@@ -165,94 +180,143 @@ def _flatten_full_profile(p: dict, flat: dict) -> None:
         school = edu.get("school", {}).get("name", "")
         if school:
             parts.append(school)
-        # Extract dynamic attributes (class year, degree, major, program type)
+        if edu.get("degree"):
+            parts.append(str(edu["degree"]))
+        if edu.get("field_of_study"):
+            parts.append(str(edu["field_of_study"]))
         for attr in edu.get("dynamic_attributes", []):
             val = attr.get("attr_value")
             if isinstance(val, list):
-                parts.extend(str(v) for v in val if v)
-            elif val:
-                parts.append(str(val))
+                parts.extend(_stringify(v) for v in val if v)
+            elif val is not None:
+                parts.append(_stringify(val))
+        if edu.get("from"):
+            parts.append(f"from:{edu['from']}")
         if edu.get("to"):
             parts.append(f"to:{edu['to']}")
         if parts:
             edu_rows.append(" | ".join(parts))
-    flat["educations"] = "; ".join(edu_rows)
+    if edu_rows:
+        flat["educations"] = "; ".join(edu_rows)
 
-    # Also extract first education's class year and degree for convenience
+    # Extract class year and degree from first education for convenience
     if educations:
         for attr in educations[0].get("dynamic_attributes", []):
             val = attr.get("attr_value")
-            # Class year is typically a 4-digit string
             if isinstance(val, str) and len(val) == 4 and val.isdigit():
                 flat["class_year"] = val
-            # Degree type
-            if isinstance(val, list) and any("Bachelor" in str(v) or "Master" in str(v) or "PhD" in str(v) or "Certificate" in str(v) for v in val):
-                flat["degree_type"] = "; ".join(str(v) for v in val)
+            if isinstance(val, list):
+                for v in val:
+                    sv = str(v)
+                    if any(d in sv for d in ("Bachelor", "Master", "PhD", "Certificate", "Doctor")):
+                        flat["degree_type"] = sv
 
-    # --- Work experience ---
+    # Work experience — dynamic attribute extraction
     experiences = p.get("experiences", [])
     exp_rows = []
     for exp in experiences:
+        parts_main = []
         position = exp.get("position", "")
         company = exp.get("company", {}).get("name", "")
+        if position:
+            parts_main.append(position)
+        if company:
+            parts_main.append(f"@ {company}")
         from_date = exp.get("from", "")
-        to_date = exp.get("to", "present")
-        # Extract industry and role type from dynamic_attributes
-        extra = []
+        to_date = exp.get("to", "")
+        if from_date or to_date:
+            parts_main.append(f"({from_date or '?'} — {to_date or 'present'})")
+        # Capture dynamic attributes
+        extras = []
         for attr in exp.get("dynamic_attributes", []):
             val = attr.get("attr_value")
             if isinstance(val, list):
-                extra.extend(str(v) for v in val if v)
-            elif val:
-                extra.append(str(val))
-        summary = f"{position} @ {company}"
-        if from_date:
-            summary += f" ({from_date} — {to_date or 'present'})"
-        if extra:
-            summary += f" [{', '.join(extra)}]"
-        exp_rows.append(summary)
-    flat["experiences"] = "; ".join(exp_rows)
+                extras.extend(_stringify(v) for v in val if v)
+            elif val is not None:
+                extras.append(_stringify(val))
+        summary = " ".join(parts_main)
+        if extras:
+            summary += f" [{', '.join(extras)}]"
+        if summary.strip():
+            exp_rows.append(summary)
+    if exp_rows:
+        flat["experiences"] = "; ".join(exp_rows)
 
-    # --- Sub-networks (class, regional groups) ---
+    # Sub-networks
     sub_networks = p.get("sub_networks", [])
-    flat["sub_networks"] = "; ".join(sn.get("title", "") for sn in sub_networks if sn.get("title"))
+    if sub_networks:
+        flat["sub_networks"] = "; ".join(
+            sn.get("title", "") for sn in sub_networks if sn.get("title")
+        )
 
-    # --- Skills ---
+    # Skills
     skills = p.get("skills", [])
     if skills:
         flat["skills"] = "; ".join(
             s.get("name", "") if isinstance(s, dict) else str(s) for s in skills
         )
 
-    # --- Industries ---
+    # Industries
     industries = p.get("industries", [])
     if industries:
         flat["industries"] = "; ".join(
             ind.get("name", "") if isinstance(ind, dict) else str(ind) for ind in industries
         )
 
-    # --- Privacy / sharing settings (might be useful context) ---
-    for key in [
-        "share_email", "share_email2", "share_email3",
-        "share_mobile_pro", "share_mobile_perso",
-    ]:
-        val = p.get(key)
-        if val:
-            flat[key] = _clean(val)
+    # Experience industries
+    exp_industries = p.get("experience_industries", [])
+    if exp_industries:
+        flat["experience_industries"] = "; ".join(
+            ind.get("name", "") if isinstance(ind, dict) else str(ind) for ind in exp_industries
+        )
 
-    # --- Profile metadata ---
-    flat["profile_is_private"] = _clean(p.get("profile_is_private"))
-    flat["is_active"] = _clean(p.get("is_active"))
-    flat["current_sign_in_at"] = _clean(p.get("current_sign_in_at"))
+    # --- Pass 3: Catch any remaining nested fields we didn't handle ---
+    handled_nested = {
+        "locations", "last_location", "postal_address",
+        "educations", "experiences", "sub_networks",
+        "skills", "industries", "experience_industries",
+        "new_photo", "new_cover_picture",
+        "can", "journeys_rights", "user_targeting",
+    }
+    for key, val in p.items():
+        if key in SKIP_FIELDS or key in handled_nested:
+            continue
+        if isinstance(val, list) and val and key not in flat:
+            # Unknown list field — serialize it
+            flat[key] = "; ".join(_serialize_item(item) for item in val)
+        elif isinstance(val, dict) and key not in flat:
+            # Unknown dict field — serialize it
+            flat[key] = _serialize_item(val)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _serialize_item(item) -> str:
+    """Convert an unknown nested item to a readable string."""
+    if isinstance(item, dict):
+        parts = []
+        for k, v in item.items():
+            if v is not None and v != "" and not isinstance(v, (dict, list)):
+                parts.append(f"{k}={v}")
+        return ", ".join(parts) if parts else ""
+    return str(item)
+
+
+def _stringify(val) -> str:
+    """Safely convert any value to a string — handles dicts, lists, scalars."""
+    if val is None:
+        return ""
+    if isinstance(val, dict):
+        return _serialize_item(val)
+    if isinstance(val, list):
+        return "; ".join(_stringify(v) for v in val if v)
+    return str(val)
+
+
 def _extract_class_year(full_name: str) -> str:
     """Extract class year from full name like "Ms. Charlotte Y. Stanton '00"."""
-    import re
     match = re.search(r"['\*](\d{2})\b", full_name)
     if match:
         year = int(match.group(1))
