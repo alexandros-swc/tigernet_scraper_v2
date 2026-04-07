@@ -17,12 +17,15 @@ class Settings:
     profile_endpoint_template: str = "/users/{my_user_id}/users/{target_user_id}"
 
     # Pagination
-    per_page: int = 100
+    per_page: int = 100  # Increased from 50 — fewer listing requests needed
     max_pages: int | None = None
 
     # Rate limiting (seconds between requests)
-    request_delay: float = 0.2
-    listing_delay: float = 0.3  # Faster for listing pages (lighter endpoint)
+    request_delay: float = 0.5   # Profile fetches — reduced from 1.5s after testing
+    listing_delay: float = 0.5   # Listing pages — reduced from 1.0s after testing
+
+    # Parallelism
+    num_tabs: int = 4  # Number of browser tabs for parallel profile fetching
 
     # Retry settings
     max_retries: int = 3

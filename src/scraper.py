@@ -105,18 +105,25 @@ def fetch_full_profiles(
     settings: Settings,
     progress: dict,
 ) -> list[dict]:
-    """
-    Fetch full profile details for each user via the Playwright browser.
-    Merges the full profile data into each user dict.
+    """Fetch full profile + /data endpoint for each user sequentially.
+    
+    Uses a single Playwright browser tab. The sync API doesn't support
+    multi-threaded access to page objects.
     """
     my_user_id = tokens["my_user_id"]
     fetched_ids = set(progress.get("fetched_profile_ids", []))
     total = len(users)
 
+    # Build list of users that still need fetching
+    to_fetch = [(i, u) for i, u in enumerate(users) if u["id"] not in fetched_ids]
+
     logger.info(
         f"Full profiles: {len(fetched_ids)} already done, "
-        f"{total - len(fetched_ids)} remaining"
+        f"{len(to_fetch)} remaining — using {settings.num_tabs} parallel tabs"
     )
+
+    if not to_fetch:
+        return users
 
     from playwright.sync_api import sync_playwright
     from src.auth import restore_browser_session
@@ -128,37 +135,55 @@ def fetch_full_profiles(
             return users
 
         try:
-            for i, user in enumerate(users):
+            counter = {"done": len(fetched_ids), "errors": 0, "data_ok": 0, "data_fail": 0}
+
+            for idx, user in to_fetch:
                 user_id = user["id"]
-                if user_id in fetched_ids:
-                    continue
-
                 try:
+                    # Fetch full profile (contact, education, experience)
                     profile = _fetch_profile(page, settings, my_user_id, user_id)
+
+                    # Fetch /data endpoint (student activities, volunteer work, etc.)
+                    profile_data = _fetch_profile_data(page, settings, user_id)
+
                     if profile:
-                        user["full_profile"] = profile
-
+                        users[idx]["full_profile"] = profile
+                    if profile_data:
+                        users[idx]["profile_data"] = profile_data
+                        counter["data_ok"] += 1
+                    else:
+                        counter["data_fail"] += 1
                     fetched_ids.add(user_id)
-                    done = len(fetched_ids)
+                    counter["done"] += 1
+                    done = counter["done"]
 
-                    if done % 100 == 0:
+                    if done % 50 == 0 or done == total:
                         pct = (done / total) * 100
-                        logger.info(f"Profiles: {done:,}/{total:,} ({pct:.1f}%)")
+                        logger.info(
+                            f"Profiles: {done:,}/{total:,} ({pct:.1f}%) "
+                            f"[errors: {counter['errors']}, "
+                            f"data_ok: {counter['data_ok']}, data_fail: {counter['data_fail']}]"
+                        )
                         progress["fetched_profile_ids"] = list(fetched_ids)
                         save_progress(progress, settings.progress_file)
 
-                    time.sleep(settings.request_delay)
-
-                except KeyboardInterrupt:
-                    logger.info("Interrupted! Saving progress...")
-                    progress["fetched_profile_ids"] = list(fetched_ids)
-                    save_progress(progress, settings.progress_file)
-                    raise
-
                 except Exception as e:
-                    logger.error(f"Error fetching profile {user_id}: {e}")
-                    time.sleep(settings.retry_backoff_base)
-                    continue
+                    counter["errors"] += 1
+                    logger.error(f"Error on profile {user_id}: {e}")
+
+                time.sleep(settings.request_delay)
+
+            logger.info(
+                f"Fetch complete: {counter['done']:,} profiles, "
+                f"{counter['errors']} errors, "
+                f"data_ok: {counter['data_ok']}, data_fail: {counter['data_fail']}"
+            )
+
+        except KeyboardInterrupt:
+            logger.info("Interrupted! Saving progress...")
+            progress["fetched_profile_ids"] = list(fetched_ids)
+            save_progress(progress, settings.progress_file)
+            raise
 
         finally:
             browser.close()
@@ -239,7 +264,7 @@ def _fetch_page(page, settings: Settings, pg: int) -> list[dict]:
     )
     data = _api_fetch(page, url)
     return data.get("users", []) if data else []
-    
+
 
 def _fetch_profile(page, settings: Settings, my_user_id: str, target_user_id: int) -> dict | None:
     url = (
@@ -250,3 +275,26 @@ def _fetch_profile(page, settings: Settings, my_user_id: str, target_user_id: in
     if data is None:
         return None
     return data.get("user", data)
+
+
+def _fetch_profile_data(page, settings: Settings, target_user_id: int) -> dict | None:
+    """
+    Fetch the /data endpoint which contains Student Activities,
+    Volunteer Activities, Princeton Information, and other custom fields
+    not available in the full_profile endpoint.
+    
+    URL pattern: /users/{target_id}/users/{target_id}/data
+    (uses the target user's ID twice)
+    """
+    url = (
+        f"{settings.base_url}/users/{target_user_id}"
+        f"/users/{target_user_id}/data"
+    )
+    data = _api_fetch(page, url)
+    if data and "center" in data:
+        logger.debug(f"Got /data for user {target_user_id} with {len(data.get('center', []))} sections")
+    elif data:
+        logger.warning(f"/data for user {target_user_id} returned unexpected keys: {list(data.keys())[:5]}")
+    else:
+        logger.debug(f"/data for user {target_user_id} returned None")
+    return data

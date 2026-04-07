@@ -38,7 +38,10 @@ PRIORITY_COLUMNS = [
     "city", "state", "country", "postal_code", "address",
     "linkedin_profile_url", "instagram_profile_url",
     "facebook_profile_url", "twitter", "website", "skype",
+    "student_activities", "primary_affiliation", "primary_class_degree_year",
+    "affiliation_s_", "class_degree_year_s__of_affiliations", "regions",
     "preferred_paa", "affinity_groups", "sub_networks",
+    "nickname", "volunteer_activity_1_",
     "educations", "experiences", "skills", "industries",
     "awards", "birthday", "birthplace", "photo_url",
 ]
@@ -53,10 +56,12 @@ def export_to_csv(users: list[dict], output_path: str, full_profiles: bool = Fal
     flat_users = []
     all_keys = set()
 
-    for user in users:
+    for i, user in enumerate(users):
         flat = _flatten_user(user, full_profiles)
         flat_users.append(flat)
         all_keys.update(flat.keys())
+        if i == 0:
+            logger.info(f"DEBUG first user flat keys ({len(flat)} total): {sorted(flat.keys())}")
 
     # Order columns: priority first, then alphabetical
     ordered = [c for c in PRIORITY_COLUMNS if c in all_keys]
@@ -117,6 +122,31 @@ def _flatten_user(user: dict, full_profiles: bool) -> dict:
     profile = user.get("full_profile", {})
     if profile and full_profiles:
         _flatten_full_profile(profile, flat)
+
+    # ---- Profile data endpoint (student activities, volunteer work, etc.) ----
+    profile_data = user.get("profile_data", {})
+    if profile_data and full_profiles:
+        # Debug: log what we got
+        import logging
+        _logger = logging.getLogger(__name__)
+        if isinstance(profile_data, dict):
+            _logger.debug(f"profile_data keys: {list(profile_data.keys())}")
+            center = profile_data.get("center", [])
+            if isinstance(center, list):
+                for sec in center:
+                    if isinstance(sec, dict):
+                        sec_name = sec.get("name", "?")
+                        sec_data = sec.get("data", [])
+                        field_names = []
+                        if isinstance(sec_data, list):
+                            for item in sec_data:
+                                if isinstance(item, dict):
+                                    dn = item.get("display_name", "")
+                                    val = item.get("value")
+                                    if dn:
+                                        field_names.append(f"{dn}={'...' if val else 'null'}")
+                        _logger.debug(f"  Section '{sec_name}': {field_names}")
+        _flatten_profile_data(profile_data, flat)
 
     return flat
 
@@ -287,6 +317,74 @@ def _flatten_full_profile(p: dict, flat: dict) -> None:
         elif isinstance(val, dict) and key not in flat:
             # Unknown dict field — serialize it
             flat[key] = _serialize_item(val)
+
+
+def _flatten_profile_data(pd: dict, flat: dict) -> None:
+    """
+    Flatten the /data endpoint response which contains Student Activities,
+    Volunteer Activities, Princeton Information, and other custom fields.
+    
+    The structure is: { "center": [...sections...], "contact": [...sections...] }
+    Each section has a "data" array of field objects with "display_name" and "value".
+    
+    This is fully dynamic — any field with a non-null value gets captured.
+    """
+    # Process both "center" and "contact" section groups
+    for section_group_key in ("center", "contact"):
+        sections = pd.get(section_group_key, [])
+        if not isinstance(sections, list):
+            continue
+
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+
+            data_items = section.get("data", [])
+            if not isinstance(data_items, list):
+                continue
+
+            for item in data_items:
+                if not isinstance(item, dict):
+                    continue
+
+                # Some items are nested sections (e.g., contact > emails > data)
+                if "data" in item and isinstance(item["data"], list):
+                    # Recurse into nested section
+                    for nested_item in item["data"]:
+                        _extract_data_field(nested_item, flat)
+                else:
+                    _extract_data_field(item, flat)
+
+
+def _extract_data_field(item: dict, flat: dict) -> None:
+    """Extract a single field from the /data endpoint into the flat dict."""
+    if not isinstance(item, dict):
+        return
+
+    display_name = item.get("display_name", "")
+    value = item.get("value")
+
+    # Skip null/empty values
+    if value is None or value == "" or value == []:
+        return
+
+    # Skip metadata fields we already get from other endpoints
+    skip_names = {
+        "Primary email", "Alternate Email 1", "Alternate Email 2",
+        "Preferred contact email", "Personal mobile", "Work landline",
+        "Landline personal", "Custom contact access message",
+        "Facebook profile URL", "Instagram profile URL",
+        "X profile URL", "LinkedIn profile url", "Website",
+    }
+    if display_name in skip_names:
+        return
+
+    col = _col_name(display_name)
+
+    if isinstance(value, list):
+        flat[col] = "; ".join(_stringify(v) for v in value if v)
+    else:
+        flat[col] = _clean(value)
 
 
 # ---------------------------------------------------------------------------
