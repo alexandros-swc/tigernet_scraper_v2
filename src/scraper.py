@@ -108,11 +108,39 @@ def fetch_full_profiles(
     """Fetch full profile + /data endpoint for each user.
     
     Uses asyncio + Playwright async API to run multiple browser tabs
-    concurrently on a single thread (avoids the threading issues with
-    Playwright's sync API).
+    concurrently on a single thread. Automatically re-authenticates
+    when tokens expire (via persistent browser profile to skip Duo).
     """
     import asyncio
-    return asyncio.run(_async_fetch_all_profiles(tokens, users, settings, progress))
+
+    max_auth_retries = 5
+    for auth_attempt in range(max_auth_retries):
+        result = asyncio.run(
+            _async_fetch_all_profiles(tokens, users, settings, progress)
+        )
+
+        # Check if there are still users to fetch (may have stopped due to auth errors)
+        fetched_ids = set(progress.get("fetched_profile_ids", []))
+        remaining = sum(1 for u in users if u["id"] not in fetched_ids)
+
+        if remaining == 0:
+            return result
+
+        # If many errors occurred, tokens probably expired — try re-auth
+        if remaining > 0 and auth_attempt < max_auth_retries - 1:
+            logger.info(
+                f"{remaining:,} profiles remaining. "
+                f"Re-authenticating (attempt {auth_attempt + 2}/{max_auth_retries})..."
+            )
+            from src.auth import refresh_tokens
+            new_tokens = refresh_tokens(headless=False)
+            if new_tokens:
+                tokens.update(new_tokens)
+                logger.info("Re-authentication successful. Resuming scrape...")
+            else:
+                logger.error("Re-authentication failed. Trying with existing tokens...")
+
+    return users
 
 
 async def _async_fetch_all_profiles(
@@ -185,7 +213,8 @@ async def _async_fetch_all_profiles(
         logger.info(f"Opened {len(pages)} browser tabs for parallel fetching.")
 
         # Shared state (safe because asyncio is single-threaded)
-        counter = {"done": len(fetched_ids), "errors": 0, "data_ok": 0, "data_fail": 0}
+        counter = {"done": len(fetched_ids), "errors": 0, "data_ok": 0, "data_fail": 0,
+                   "consecutive_errors": 0}
         work_queue = asyncio.Queue()
 
         for idx, user in to_fetch:
@@ -194,6 +223,11 @@ async def _async_fetch_all_profiles(
         async def worker(page, worker_id):
             """Async worker — fetches profiles using its assigned browser tab."""
             while not work_queue.empty():
+                # If too many consecutive errors, tokens likely expired — stop early
+                if counter["consecutive_errors"] >= 10:
+                    logger.warning(f"Worker {worker_id}: stopping due to consecutive errors (likely token expiration)")
+                    break
+
                 try:
                     idx, user = work_queue.get_nowait()
                 except asyncio.QueueEmpty:
@@ -209,6 +243,10 @@ async def _async_fetch_all_profiles(
 
                     if profile:
                         users[idx]["full_profile"] = profile
+                        counter["consecutive_errors"] = 0  # Reset on success
+                    else:
+                        counter["consecutive_errors"] += 1
+
                     if profile_data:
                         users[idx]["profile_data"] = profile_data
                         counter["data_ok"] += 1

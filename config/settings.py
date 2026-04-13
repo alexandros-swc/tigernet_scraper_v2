@@ -21,11 +21,11 @@ class Settings:
     max_pages: int | None = None
 
     # Rate limiting (seconds between requests)
-    request_delay: float = 0.5   # Profile fetches — reduced from 1.5s after testing
-    listing_delay: float = 0.5   # Listing pages — reduced from 1.0s after testing
+    request_delay: float = 0.5   # Delay between users — 0.2 triggered Cloudflare 403s
+    listing_delay: float = 0.5   # Listing pages
 
     # Parallelism
-    num_tabs: int = 4  # Number of browser tabs for parallel profile fetching
+    num_tabs: int = 3  # 8 tabs triggered Cloudflare; 4 is safer
 
     # Retry settings
     max_retries: int = 3

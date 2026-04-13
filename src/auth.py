@@ -508,3 +508,13 @@ def restore_browser_session(playwright_instance, tokens: dict, settings=None):
 
     logger.info(f"Browser session restored. Current URL: {page.url}")
     return browser, page
+
+
+
+
+def refresh_tokens(headless: bool = False) -> dict | None:
+    """Re-authenticate to get fresh tokens."""
+    logger.info("Refreshing tokens...")
+    if os.path.exists(TOKEN_CACHE_PATH):
+        os.remove(TOKEN_CACHE_PATH)
+    return _browser_login(headless=headless)
