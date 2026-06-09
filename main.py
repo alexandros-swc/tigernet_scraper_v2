@@ -16,11 +16,12 @@ import argparse
 import logging
 import sys
 import os
+import pprint
 
 from src.auth import authenticate
 from src.scraper import scrape_directory, fetch_full_profiles
 from src.exporter import export_to_csv
-from src.utils import setup_logging, load_progress, save_progress
+from src.utils import setup_logging, load_progress
 from config.settings import Settings
 
 
@@ -28,6 +29,58 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Scrape the TigerNet alumni directory"
     )
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    init_db = subparsers.add_parser(
+        "init-db",
+        help="Initialize the durable PostgreSQL schema",
+    )
+    init_db.add_argument("--database-url", default=None)
+
+    seed = subparsers.add_parser(
+        "seed",
+        help="Seed alumni IDs and durable profile jobs from listing pages",
+    )
+    seed.add_argument("--school", default="princeton")
+    seed.add_argument("--database-url", default=None)
+    seed.add_argument("--run-id", type=int, default=None)
+    seed.add_argument("--per-page", type=int, default=100)
+    seed.add_argument("--max-pages", type=int, default=None)
+    seed.add_argument("--headless", action="store_true")
+    seed.add_argument("--raw-root", default="output/raw")
+
+    work = subparsers.add_parser(
+        "work",
+        help="Process queued profile jobs from PostgreSQL",
+    )
+    work.add_argument("--school", default="princeton")
+    work.add_argument("--database-url", default=None)
+    work.add_argument("--run-id", type=int, default=None)
+    work.add_argument("--worker-id", default=None)
+    work.add_argument("--batch-size", type=int, default=5)
+    work.add_argument("--max-jobs", type=int, default=None)
+    work.add_argument("--lease-seconds", type=int, default=900)
+    work.add_argument("--headless", action="store_true")
+    work.add_argument("--raw-root", default="output/raw")
+
+    status = subparsers.add_parser(
+        "status",
+        help="Print durable scrape run status",
+    )
+    status.add_argument("--school", default="princeton")
+    status.add_argument("--database-url", default=None)
+    status.add_argument("--run-id", type=int, default=None)
+
+    export_db = subparsers.add_parser(
+        "export-db",
+        help="Export normalized database results to CSV",
+    )
+    export_db.add_argument("--school", default="princeton")
+    export_db.add_argument("--database-url", default=None)
+    export_db.add_argument("--run-id", type=int, default=None)
+    export_db.add_argument("--output", default="output/tigernet_alumni_db.csv")
+
     parser.add_argument(
         "--full-profiles",
         action="store_true",
@@ -64,8 +117,81 @@ def parse_args():
     return parser.parse_args()
 
 
+def run_production_command(args) -> None:
+    """Dispatch database-backed production runtime commands."""
+    if args.command == "init-db":
+        from src.runtime.init_db import initialize_database
+
+        result = initialize_database(database_url=args.database_url)
+        pprint.pp(result)
+        return
+
+    if args.command == "seed":
+        from src.runtime.seeder import seed_school
+
+        result = seed_school(
+            school_slug=args.school,
+            database_url=args.database_url,
+            run_id=args.run_id,
+            per_page=args.per_page,
+            max_pages=args.max_pages,
+            headless=args.headless,
+            raw_root=args.raw_root,
+        )
+        pprint.pp(result)
+        return
+
+    if args.command == "work":
+        from src.runtime.worker import work_school
+
+        result = work_school(
+            school_slug=args.school,
+            database_url=args.database_url,
+            run_id=args.run_id,
+            worker_id=args.worker_id,
+            batch_size=args.batch_size,
+            max_jobs=args.max_jobs,
+            lease_seconds=args.lease_seconds,
+            headless=args.headless,
+            raw_root=args.raw_root,
+        )
+        pprint.pp(result)
+        return
+
+    if args.command == "status":
+        from src.runtime.status import get_status
+
+        result = get_status(
+            school_slug=args.school,
+            database_url=args.database_url,
+            run_id=args.run_id,
+        )
+        pprint.pp(result)
+        return
+
+    if args.command == "export-db":
+        from src.runtime.export_db import export_results_to_csv
+
+        result = export_results_to_csv(
+            output_path=args.output,
+            school_slug=args.school,
+            database_url=args.database_url,
+            run_id=args.run_id,
+        )
+        pprint.pp(result)
+        return
+
+    raise ValueError(f"Unknown command: {args.command}")
+
+
 def main():
     args = parse_args()
+    setup_logging()
+
+    if args.command:
+        run_production_command(args)
+        return
+
     settings = Settings(
         max_pages=args.max_pages,
         output_path=args.output,
@@ -75,7 +201,6 @@ def main():
     if args.per_page is not None:
         settings.per_page = args.per_page
 
-    setup_logging()
     logger = logging.getLogger(__name__)
 
     logger.info("=" * 60)

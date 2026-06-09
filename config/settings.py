@@ -35,6 +35,7 @@ class Settings:
     # Output
     output_path: str = "output/tigernet_alumni.csv"
     progress_file: str = "output/progress.json"
+    raw_store_root: str = "output/raw"
 
     # Browser settings
     headless: bool = False
