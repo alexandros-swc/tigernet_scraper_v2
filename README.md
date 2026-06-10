@@ -71,6 +71,19 @@ Fetches detailed data for each user (email, phone, work history, education, Link
 python main.py --max-pages 5
 ```
 
+### Check auth without scraping
+
+```bash
+python main.py auth-check --skip-api-check
+python main.py auth-check
+python main.py auth-check --login-if-needed
+```
+
+`auth-check` reports token-cache status and can verify a single listing API call.
+The first fresh login uses the persistent browser profile in
+`output/browser-profile/tigernet`, so Duo/CAS remembered-device state can be
+reused on later token refreshes.
+
 ### Resume after interruption
 
 ```bash

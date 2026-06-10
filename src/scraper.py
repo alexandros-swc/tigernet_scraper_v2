@@ -13,6 +13,7 @@ import json
 import logging
 import time
 
+from src.auth import AuthExpiredError
 from src.utils import save_progress
 from config.settings import Settings
 
@@ -76,6 +77,13 @@ def scrape_directory(
 
                 except KeyboardInterrupt:
                     logger.info("Interrupted! Saving progress...")
+                    progress["listing_users"] = all_users
+                    progress["listing_last_page"] = pg - 1
+                    save_progress(progress, settings.progress_file)
+                    raise
+
+                except AuthExpiredError:
+                    logger.warning("Authentication expired while scraping listings. Saving progress.")
                     progress["listing_users"] = all_users
                     progress["listing_last_page"] = pg - 1
                     save_progress(progress, settings.progress_file)
@@ -215,6 +223,7 @@ async def _async_fetch_all_profiles(
         # Shared state (safe because asyncio is single-threaded)
         counter = {"done": len(fetched_ids), "errors": 0, "data_ok": 0, "data_fail": 0,
                    "consecutive_errors": 0}
+        auth_expired = {"reason": None}
         work_queue = asyncio.Queue()
 
         for idx, user in to_fetch:
@@ -223,6 +232,9 @@ async def _async_fetch_all_profiles(
         async def worker(page, worker_id):
             """Async worker — fetches profiles using its assigned browser tab."""
             while not work_queue.empty():
+                if auth_expired["reason"]:
+                    break
+
                 # If too many consecutive errors, tokens likely expired — stop early
                 if counter["consecutive_errors"] >= 10:
                     logger.warning(f"Worker {worker_id}: stopping due to consecutive errors (likely token expiration)")
@@ -266,6 +278,15 @@ async def _async_fetch_all_profiles(
                         progress["fetched_profile_ids"] = list(fetched_ids)
                         save_progress(progress, settings.progress_file)
 
+                except AuthExpiredError as e:
+                    counter["errors"] += 1
+                    auth_expired["reason"] = str(e)
+                    logger.warning(
+                        f"Worker {worker_id}: authentication expired while fetching "
+                        f"profile {user_id}: {e}"
+                    )
+                    break
+
                 except Exception as e:
                     counter["errors"] += 1
                     logger.error(f"Worker {worker_id}: error on profile {user_id}: {e}")
@@ -278,6 +299,9 @@ async def _async_fetch_all_profiles(
         except KeyboardInterrupt:
             logger.info("Interrupted! Saving progress...")
 
+        if auth_expired["reason"]:
+            logger.warning(f"Stopping profile fetch early: {auth_expired['reason']}")
+
         logger.info(
             f"Fetch complete: {counter['done']:,} profiles, "
             f"{counter['errors']} errors, "
@@ -286,7 +310,7 @@ async def _async_fetch_all_profiles(
 
         # Save final progress
         progress["fetched_profile_ids"] = list(fetched_ids)
-        progress["profiles_complete"] = True
+        progress["profiles_complete"] = len(fetched_ids) >= total
         save_progress(progress, settings.progress_file)
 
         await browser.close()
@@ -297,6 +321,31 @@ async def _async_fetch_all_profiles(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+_AUTH_EXPIRED_STATUSES = {401, 419}
+_AUTH_EXPIRED_BODY_MARKERS = (
+    "cas",
+    "duo",
+    "login",
+    "sign in",
+    "session expired",
+    "unauthorized",
+)
+
+
+def _auth_failure_reason(result: dict | None) -> str | None:
+    """Return a reason when an API response looks like expired auth."""
+    if not isinstance(result, dict) or not result.get("_error"):
+        return None
+
+    status = result.get("status")
+    body = str(result.get("body") or result.get("message") or "").lower()
+    if status in _AUTH_EXPIRED_STATUSES:
+        return f"API returned auth-like status {status}"
+    if body and any(marker in body for marker in _AUTH_EXPIRED_BODY_MARKERS):
+        return "API response body looked like a login/session failure"
+    return None
+
 
 def _api_fetch(page, url: str, max_retries: int = 3) -> dict | None:
     """Make an API call from inside the Playwright browser."""
@@ -311,10 +360,20 @@ def _api_fetch(page, url: str, max_retries: int = 3) -> dict | None:
                                 'x-requested-with': 'XMLHttpRequest'
                             }
                         });
+                        const text = await resp.text();
                         if (!resp.ok) {
-                            return { _error: true, status: resp.status, body: (await resp.text()).substring(0, 200) };
+                            return { _error: true, status: resp.status, body: text.substring(0, 500) };
                         }
-                        return await resp.json();
+                        try {
+                            return JSON.parse(text);
+                        } catch(e) {
+                            return {
+                                _error: true,
+                                status: resp.status,
+                                body: text.substring(0, 500),
+                                message: e.toString()
+                            };
+                        }
                     } catch(e) {
                         return { _error: true, message: e.toString() };
                     }
@@ -325,12 +384,18 @@ def _api_fetch(page, url: str, max_retries: int = 3) -> dict | None:
             if result and not result.get("_error"):
                 return result
 
-            status = result.get("status", "unknown")
+            auth_reason = _auth_failure_reason(result)
+            if auth_reason:
+                raise AuthExpiredError(f"{auth_reason} while fetching {url[:120]}")
+
+            status = result.get("status", "unknown") if isinstance(result, dict) else "unknown"
             logger.warning(f"API error (status {status}) on attempt {attempt}")
 
             if attempt < max_retries:
                 time.sleep(2 ** attempt)
 
+        except AuthExpiredError:
+            raise
         except Exception as e:
             logger.warning(f"Fetch error on attempt {attempt}: {e}")
             if attempt < max_retries:
@@ -412,10 +477,20 @@ _JS_FETCH = """async (url) => {
                 'x-requested-with': 'XMLHttpRequest'
             }
         });
+        const text = await resp.text();
         if (!resp.ok) {
-            return { _error: true, status: resp.status, body: (await resp.text()).substring(0, 200) };
+            return { _error: true, status: resp.status, body: text.substring(0, 500) };
         }
-        return await resp.json();
+        try {
+            return JSON.parse(text);
+        } catch(e) {
+            return {
+                _error: true,
+                status: resp.status,
+                body: text.substring(0, 500),
+                message: e.toString()
+            };
+        }
     } catch(e) {
         return { _error: true, message: e.toString() };
     }
@@ -432,12 +507,18 @@ async def _async_api_fetch(page, url: str, max_retries: int = 3) -> dict | None:
             if result and not result.get("_error"):
                 return result
 
-            status = result.get("status", "unknown")
+            auth_reason = _auth_failure_reason(result)
+            if auth_reason:
+                raise AuthExpiredError(f"{auth_reason} while fetching {url[:120]}")
+
+            status = result.get("status", "unknown") if isinstance(result, dict) else "unknown"
             logger.warning(f"API error (status {status}) on attempt {attempt}")
 
             if attempt < max_retries:
                 await asyncio.sleep(2 ** attempt)
 
+        except AuthExpiredError:
+            raise
         except Exception as e:
             logger.warning(f"Fetch error on attempt {attempt}: {e}")
             if attempt < max_retries:

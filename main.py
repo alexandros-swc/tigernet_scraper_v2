@@ -81,6 +81,22 @@ def parse_args():
     export_db.add_argument("--run-id", type=int, default=None)
     export_db.add_argument("--output", default="output/tigernet_alumni_db.csv")
 
+    auth_check = subparsers.add_parser(
+        "auth-check",
+        help="Inspect cached TigerNet auth and optionally test an API call",
+    )
+    auth_check.add_argument("--headless", action="store_true")
+    auth_check.add_argument(
+        "--login-if-needed",
+        action="store_true",
+        help="Perform a fresh login if no valid token cache exists",
+    )
+    auth_check.add_argument(
+        "--skip-api-check",
+        action="store_true",
+        help="Only inspect the token cache; do not open a browser/API session",
+    )
+
     parser.add_argument(
         "--full-profiles",
         action="store_true",
@@ -112,7 +128,7 @@ def parse_args():
     parser.add_argument(
         "--headless",
         action="store_true",
-        help="Run browser in headless mode (requires automated Duo approval)",
+        help="Run browser headless (requires valid cached or remembered-device auth)",
     )
     return parser.parse_args()
 
@@ -177,6 +193,17 @@ def run_production_command(args) -> None:
             school_slug=args.school,
             database_url=args.database_url,
             run_id=args.run_id,
+        )
+        pprint.pp(result)
+        return
+
+    if args.command == "auth-check":
+        from src.runtime.auth_check import check_auth
+
+        result = check_auth(
+            headless=args.headless,
+            login_if_needed=args.login_if_needed,
+            api_check=not args.skip_api_check,
         )
         pprint.pp(result)
         return

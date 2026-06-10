@@ -39,6 +39,59 @@ class ScrapeRepository:
             )
             return cur.fetchone()
 
+    def ensure_account(
+        self,
+        school_id: int,
+        label: str,
+        secret_ref: str | None = None,
+    ) -> dict:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO accounts (school_id, label, secret_ref, status)
+                VALUES (%s, %s, %s, 'available')
+                ON CONFLICT (school_id, label) DO UPDATE SET
+                    secret_ref = COALESCE(EXCLUDED.secret_ref, accounts.secret_ref),
+                    status = 'available',
+                    updated_at = now()
+                RETURNING *
+                """,
+                (school_id, label, secret_ref),
+            )
+            return cur.fetchone()
+
+    def record_auth_session(
+        self,
+        account_id: int,
+        status: str,
+        token_expires_at=None,
+        failure_reason: str | None = None,
+        browser_profile_path: str | None = None,
+    ) -> dict:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO auth_sessions (
+                    account_id,
+                    status,
+                    browser_profile_path,
+                    token_expires_at,
+                    last_validated_at,
+                    failure_reason
+                )
+                VALUES (%s, %s, %s, %s, now(), %s)
+                RETURNING *
+                """,
+                (
+                    account_id,
+                    status,
+                    browser_profile_path,
+                    token_expires_at,
+                    failure_reason,
+                ),
+            )
+            return cur.fetchone()
+
     def create_run(self, school_id: int, mode: str = "full", notes: str | None = None) -> dict:
         with self.conn.cursor() as cur:
             cur.execute(
@@ -255,6 +308,33 @@ class ScrapeRepository:
                 WHERE id = %s
                 """,
                 (job_id,),
+            )
+
+    def release_job(
+        self,
+        job_id: int,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE profile_jobs
+                SET
+                    status = 'pending',
+                    leased_by = NULL,
+                    lease_expires_at = NULL,
+                    next_attempt_at = NULL,
+                    last_error_code = COALESCE(%s, last_error_code),
+                    last_error_message = COALESCE(%s, last_error_message),
+                    updated_at = now()
+                WHERE id = %s
+                """,
+                (
+                    error_code,
+                    error_message[:1000] if error_message else None,
+                    job_id,
+                ),
             )
 
     def mark_job_retry(

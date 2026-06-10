@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import time
 import uuid
 
 from config.settings import Settings
-from src.auth import authenticate, restore_browser_session
+from src.auth import AuthExpiredError, authenticate, get_access_token_expiry, restore_browser_session
 from src.schools import get_adapter
 from src.scraper import _api_fetch
 from src.storage.db import connection, ensure_schema
@@ -43,6 +44,10 @@ def work_school(
             base_url=adapter.base_url,
             platform=adapter.platform,
         )
+        account = repo.ensure_account(
+            school_id=school["id"],
+            label=os.getenv("TIGERNET_ACCOUNT_LABEL", "default"),
+        )
         run = repo.get_run(run_id) if run_id else repo.latest_run_for_school(school_slug)
         if not run:
             raise RuntimeError("No scrape run found. Run seed first or pass --run-id.")
@@ -52,12 +57,26 @@ def work_school(
         logger.info("Authenticating worker %s for run %s", worker_id, run["id"])
         tokens = authenticate(headless=headless)
         if not tokens:
+            repo.record_auth_session(
+                account_id=account["id"],
+                status="auth_failed",
+                failure_reason="authenticate returned no tokens",
+            )
             raise RuntimeError("Authentication failed; worker cannot start.")
+        repo.record_auth_session(
+            account_id=account["id"],
+            status="active",
+            token_expires_at=get_access_token_expiry(tokens),
+            browser_profile_path=tokens.get("browser_profile_path"),
+        )
 
         from playwright.sync_api import sync_playwright
 
         completed = 0
         errors = 0
+        auth_required = False
+        auth_error = None
+        stop_reason = "max_jobs_reached" if max_jobs is not None else "queue_empty"
         consecutive_empty_claims = 0
         my_user_id = tokens["my_user_id"]
 
@@ -91,12 +110,13 @@ def work_school(
                             error_count=errors,
                         )
                         if consecutive_empty_claims >= 2:
+                            stop_reason = "queue_empty"
                             break
                         time.sleep(5)
                         continue
 
                     consecutive_empty_claims = 0
-                    for job in jobs:
+                    for job_index, job in enumerate(jobs):
                         if max_jobs is not None and completed >= max_jobs:
                             break
                         try:
@@ -125,6 +145,37 @@ def work_school(
                                 job["external_user_id"],
                                 completed,
                             )
+                        except AuthExpiredError as exc:
+                            auth_required = True
+                            auth_error = str(exc)
+                            stop_reason = "auth_required"
+                            logger.warning(
+                                "Authentication is required; releasing leased jobs and stopping worker: %s",
+                                auth_error,
+                            )
+                            for leased_job in jobs[job_index:]:
+                                repo.release_job(
+                                    job_id=leased_job["id"],
+                                    error_code=exc.__class__.__name__,
+                                    error_message=auth_error,
+                                )
+                            repo.record_auth_session(
+                                account_id=account["id"],
+                                status="auth_required",
+                                token_expires_at=get_access_token_expiry(tokens),
+                                failure_reason=auth_error,
+                                browser_profile_path=tokens.get("browser_profile_path"),
+                            )
+                            repo.heartbeat(
+                                worker_id=worker_id,
+                                run_id=run["id"],
+                                status="auth_required",
+                                hostname=socket.gethostname(),
+                                current_job_id=job["id"],
+                                completed_count=completed,
+                                error_count=errors,
+                            )
+                            break
                         except Exception as exc:
                             errors += 1
                             logger.exception(
@@ -137,11 +188,13 @@ def work_school(
                                 error_message=str(exc),
                             )
                         time.sleep(settings.request_delay)
+                    if auth_required:
+                        break
             finally:
                 repo.heartbeat(
                     worker_id=worker_id,
                     run_id=run["id"],
-                    status="stopped",
+                    status="auth_required" if auth_required else "stopped",
                     hostname=socket.gethostname(),
                     completed_count=completed,
                     error_count=errors,
@@ -153,6 +206,9 @@ def work_school(
         "worker_id": worker_id,
         "completed": completed,
         "errors": errors,
+        "auth_required": auth_required,
+        "stop_reason": stop_reason,
+        "auth_error": auth_error,
     }
 
 

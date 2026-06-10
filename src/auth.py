@@ -18,6 +18,7 @@ import logging
 import os
 import base64
 import time
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
@@ -34,6 +35,17 @@ REQUIRED_COOKIES = [
 ]
 
 TOKEN_CACHE_PATH = "output/.token_cache.json"
+BROWSER_PROFILE_PATH = "output/browser-profile/tigernet"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/146.0.0.0 Safari/537.36"
+)
+AUTH_COOKIE_KEYWORDS = ("token", "session", "hivebrite", "clearance", "cf_", "xsrf")
+
+
+class AuthExpiredError(RuntimeError):
+    """Raised when TigerNet API responses indicate unusable authentication."""
 
 
 def authenticate(headless: bool = False) -> dict | None:
@@ -81,15 +93,8 @@ def _browser_login(headless: bool) -> dict | None:
         return None
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/146.0.0.0 Safari/537.36"
-            )
-        )
-        page = context.new_page()
+        context = _launch_persistent_context(p, headless=headless)
+        page = context.pages[0] if context.pages else context.new_page()
 
         try:
             # Step 1: Navigate to TigerNet
@@ -97,10 +102,13 @@ def _browser_login(headless: bool) -> dict | None:
             page.goto("https://tigernet.princeton.edu", wait_until="domcontentloaded", timeout=30000)
             # Give the page time to fully render (JS, cookie banner, etc.)
             time.sleep(5)
+            already_authenticated = _looks_authenticated(page)
+            if already_authenticated:
+                logger.info("Persistent browser profile is already logged into TigerNet.")
 
             # Step 2: Dismiss cookie consent banner — MUST happen before Login click
             logger.info("Looking for cookie consent banner...")
-            cookie_dismissed = False
+            cookie_dismissed = already_authenticated
             for cookie_selector in [
                 "button:has-text('Accept all cookies')",
                 "text=Accept all cookies",
@@ -112,7 +120,7 @@ def _browser_login(headless: bool) -> dict | None:
             ]:
                 try:
                     btn = page.locator(cookie_selector).first
-                    if btn.is_visible(timeout=2000):
+                    if not already_authenticated and btn.is_visible(timeout=2000):
                         logger.info(f"Dismissing cookie banner via: {cookie_selector}")
                         btn.click()
                         cookie_dismissed = True
@@ -125,7 +133,7 @@ def _browser_login(headless: bool) -> dict | None:
                 # Try clicking the X close button on the banner
                 try:
                     close_btn = page.locator("button[aria-label='Close'], .close-btn, button:has-text('×')").first
-                    if close_btn.is_visible(timeout=2000):
+                    if not already_authenticated and close_btn.is_visible(timeout=2000):
                         logger.info("Closing cookie banner via X button...")
                         close_btn.click()
                         cookie_dismissed = True
@@ -138,7 +146,7 @@ def _browser_login(headless: bool) -> dict | None:
 
             # Step 3: Click the Login button on the TigerNet landing page
             logger.info("Clicking Login button...")
-            login_clicked = False
+            login_clicked = already_authenticated
             for selector in [
                 "a:has-text('Login')",
                 "button:has-text('Login')",
@@ -149,7 +157,7 @@ def _browser_login(headless: bool) -> dict | None:
             ]:
                 try:
                     btn = page.locator(selector).first
-                    if btn.is_visible(timeout=3000):
+                    if not already_authenticated and btn.is_visible(timeout=3000):
                         btn.click()
                         login_clicked = True
                         logger.info(f"Clicked login button via: {selector}")
@@ -157,7 +165,7 @@ def _browser_login(headless: bool) -> dict | None:
                 except Exception:
                     continue
 
-            if not login_clicked:
+            if not login_clicked and not already_authenticated:
                 # Last resort: navigate directly to CAS login URL
                 logger.info("Login button not found. Navigating directly to CAS...")
                 page.goto(
@@ -166,43 +174,55 @@ def _browser_login(headless: bool) -> dict | None:
                     timeout=30000,
                 )
 
-            # Step 4: Wait for CAS login form to appear and fill it
-            logger.info("Waiting for CAS login form...")
-            page.wait_for_selector("#username", timeout=30000)
-            logger.info("Filling CAS credentials...")
-            page.fill("#username", netid)
-            page.fill("#password", password)
-            page.click('button[type="submit"], input[type="submit"]')
+            # Step 4: CAS may show the username form, or an existing CAS/Duo
+            # remembered-device session may redirect directly back to TigerNet.
+            logger.info("Waiting for CAS login form or remembered-device redirect...")
+            auth_state = _wait_for_selector_or_authenticated(page, "#username, #password", 30)
+            if auth_state == "selector":
+                logger.info("Filling CAS credentials...")
+                try:
+                    if page.locator("#username").first.is_visible(timeout=1000):
+                        page.fill("#username", netid)
+                except Exception:
+                    pass
+                page.fill("#password", password)
+                page.click('button[type="submit"], input[type="submit"]')
+                logger.info(
+                    "Waiting for Duo MFA approval if required. "
+                    "Approve the push and choose the remembered-device option."
+                )
+            elif auth_state == "authenticated":
+                logger.info("CAS/Duo redirected to TigerNet without a fresh prompt.")
+            else:
+                logger.info(
+                    "CAS form did not appear. Waiting for existing SSO/Duo "
+                    "session or remembered-device redirect."
+                )
 
-            # Step 5: Wait for Duo MFA
-            logger.info(
-                "Waiting for Duo MFA approval... "
-                "Please approve the push notification on your phone."
-            )
-            # Duo will either auto-push or show a prompt.
-            # We wait up to 2 minutes for the user to approve.
-            page.wait_for_url(
-                "**/my-homepage**",
-                timeout=120000,
-            )
-            logger.info("Duo approved! Logged into TigerNet.")
+            if auth_state != "authenticated":
+                if not _wait_for_authenticated(page, timeout_seconds=120):
+                    logger.error(
+                        "Timed out before TigerNet authenticated. If Duo prompted "
+                        "in a visible browser, approve it and select the "
+                        "remembered-device option before the timeout."
+                    )
+                    return None
+                logger.info("Logged into TigerNet.")
 
             # Step 6: Wait for the page to fully initialize and set tokens
             # The Hivebrite SPA needs a moment to set API tokens after login
             logger.info("Waiting for page to fully initialize...")
             time.sleep(5)
+            if not _wait_for_api_session(page, timeout_seconds=30):
+                logger.error("TigerNet API session did not become usable after login.")
+                return None
 
             # Step 7: Extract cookies
             cookies_list = context.cookies()
-            cookies = {}
-            for c in cookies_list:
-                cookies[c["name"]] = c["value"]
+            cookies = _cookies_by_name(cookies_list)
 
             # Log which auth-related cookies we found
-            auth_cookie_names = [
-                n for n in cookies
-                if any(k in n.lower() for k in ["token", "session", "hivebrite", "clearance", "cf_", "xsrf"])
-            ]
+            auth_cookie_names = _auth_cookie_names(cookies_list)
             logger.info(f"Found {len(cookies)} cookies, auth-related: {auth_cookie_names}")
 
             # Step 8: Get CSRF token from cookies (Hivebrite uses XSRF-TOKEN cookie)
@@ -214,25 +234,15 @@ def _browser_login(headless: bool) -> dict | None:
             else:
                 csrf_token = _extract_csrf_token(page)
 
-            # Step 9: Try to get API access token from localStorage or by making an API call
+            # Step 9: Require the API access token as a cookie. The scraper
+            # restores auth in new browser contexts by injecting cookies.
             access_token = cookies.get("api_access_token", "")
-
             if not access_token:
-                # Hivebrite may store the token in localStorage
-                logger.info("No api_access_token cookie. Checking localStorage...")
-                try:
-                    access_token = page.evaluate(
-                        """() => {
-                            return localStorage.getItem('api_access_token')
-                                || localStorage.getItem('access_token')
-                                || localStorage.getItem('token')
-                                || null;
-                        }"""
-                    ) or ""
-                    if access_token:
-                        logger.info("Found access token in localStorage.")
-                except Exception:
-                    pass
+                logger.error(
+                    "TigerNet did not set api_access_token as a cookie; "
+                    "not caching this session because scraper API calls would fail."
+                )
+                return None
 
             # Step 10: Get user ID — try multiple approaches
             my_user_id = None
@@ -334,8 +344,10 @@ def _browser_login(headless: bool) -> dict | None:
             # Keep all cookies (the session cookies are what matter for API access)
             tokens = {
                 "cookies": cookies,
+                "cookie_jar": cookies_list,
                 "csrf_token": csrf_token,
                 "my_user_id": my_user_id,
+                "browser_profile_path": get_browser_profile_path(),
             }
 
             # Cache tokens for reuse
@@ -354,7 +366,144 @@ def _browser_login(headless: bool) -> dict | None:
             return None
 
         finally:
-            browser.close()
+            context.close()
+
+
+def get_browser_profile_path() -> str:
+    """Return the persistent browser profile path used for CAS/Duo state."""
+    load_dotenv()
+    return os.getenv("TIGERNET_BROWSER_PROFILE_DIR", BROWSER_PROFILE_PATH)
+
+
+def _launch_persistent_context(playwright_instance, headless: bool):
+    """Launch Chromium with a durable profile so Duo can remember this device."""
+    profile_path = get_browser_profile_path()
+    os.makedirs(profile_path, exist_ok=True)
+    logger.info("Using persistent browser profile: %s", profile_path)
+    return playwright_instance.chromium.launch_persistent_context(
+        user_data_dir=profile_path,
+        headless=headless,
+        user_agent=USER_AGENT,
+    )
+
+
+def _looks_authenticated(page) -> bool:
+    """Best-effort check that the browser has real TigerNet auth state."""
+    try:
+        cookies = page.context.cookies("https://tigernet.princeton.edu")
+        cookie_names = {cookie.get("name") for cookie in cookies}
+        if "api_access_token" in cookie_names:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _wait_for_api_session(page, timeout_seconds: int) -> bool:
+    """Wait until TigerNet API calls work from the authenticated browser."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if _looks_authenticated(page):
+            return True
+        time.sleep(1)
+    return False
+
+
+def _wait_for_authenticated(page, timeout_seconds: int) -> bool:
+    """Wait until the browser reaches authenticated TigerNet content."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if _looks_authenticated(page):
+            return True
+        time.sleep(1)
+    return False
+
+
+def _wait_for_selector_or_authenticated(page, selector: str, timeout_seconds: int) -> str:
+    """Wait for a selector, or for an already-authenticated TigerNet redirect."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if _looks_authenticated(page):
+            return "authenticated"
+        try:
+            if page.locator(selector).first.is_visible(timeout=1000):
+                return "selector"
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return "timeout"
+
+
+def _cookies_by_name(cookies_list: list[dict]) -> dict:
+    """Keep the legacy name/value cache shape for existing scraper callers."""
+    cookies = {}
+    for cookie in cookies_list:
+        cookies[cookie["name"]] = cookie["value"]
+    return cookies
+
+
+def _auth_cookie_names(cookies_list: list[dict]) -> list[str]:
+    """Return auth-related cookie names with domains, never values."""
+    names = []
+    for cookie in cookies_list:
+        name = cookie.get("name", "")
+        if any(keyword in name.lower() for keyword in AUTH_COOKIE_KEYWORDS):
+            domain = cookie.get("domain", "")
+            names.append(f"{domain}:{name}" if domain else name)
+    return names
+
+
+def _cookies_for_context(tokens: dict) -> list[dict]:
+    """Build Playwright add_cookies payloads from new or legacy token caches."""
+    cookie_jar = tokens.get("cookie_jar") or []
+    if cookie_jar:
+        cookies = []
+        for raw_cookie in cookie_jar:
+            cookie = _cookie_for_context(raw_cookie)
+            if cookie:
+                cookies.append(cookie)
+        return cookies
+
+    cookies = []
+    for name, value in tokens.get("cookies", {}).items():
+        cookie = _cookie_for_context({
+            "name": name,
+            "value": value,
+            "domain": "tigernet.princeton.edu",
+            "path": "/",
+        })
+        if cookie:
+            cookies.append(cookie)
+    return cookies
+
+
+def _cookie_for_context(raw_cookie: dict) -> dict | None:
+    """Keep only fields accepted by Playwright context.add_cookies."""
+    if not raw_cookie.get("name") or raw_cookie.get("value") is None:
+        return None
+
+    allowed_fields = (
+        "name",
+        "value",
+        "url",
+        "domain",
+        "path",
+        "expires",
+        "httpOnly",
+        "secure",
+        "sameSite",
+    )
+    cookie = {
+        key: raw_cookie[key]
+        for key in allowed_fields
+        if key in raw_cookie and raw_cookie[key] is not None
+    }
+    if "url" not in cookie and "domain" not in cookie:
+        cookie["domain"] = "tigernet.princeton.edu"
+    if "url" not in cookie and "path" not in cookie:
+        cookie["path"] = "/"
+    return cookie
 
 
 def _extract_csrf_token(page) -> str:
@@ -420,21 +569,13 @@ def _extract_user_id_from_jwt(token: str) -> str | None:
         return None
 
 
-def _load_cached_tokens() -> dict | None:
-    """Load tokens from cache file if they exist and are still valid."""
-    if not os.path.exists(TOKEN_CACHE_PATH):
+def _decode_jwt_payload(token: str) -> dict | None:
+    """Decode a JWT payload without validating the signature."""
+    if not token:
         return None
 
     try:
-        with open(TOKEN_CACHE_PATH, "r") as f:
-            tokens = json.load(f)
-
-        # Check if access token is still valid by decoding its exp claim
-        access_token = tokens.get("cookies", {}).get("api_access_token", "")
-        if not access_token:
-            return None
-
-        parts = access_token.split(".")
+        parts = token.split(".")
         if len(parts) != 3:
             return None
 
@@ -443,19 +584,101 @@ def _load_cached_tokens() -> dict | None:
         if padding != 4:
             payload += "=" * padding
 
-        decoded = json.loads(base64.urlsafe_b64decode(payload))
-        exp = decoded.get("exp", 0)
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except Exception as e:
+        logger.warning(f"Could not decode JWT payload: {e}")
+        return None
 
-        import time
-        if time.time() > exp - 300:  # 5 minute buffer
-            logger.info("Cached tokens expired. Need fresh login.")
-            return None
 
-        return tokens
+def get_access_token_expiry(tokens: dict | None) -> datetime | None:
+    """Return the cached access-token expiration time, if present."""
+    if not tokens:
+        return None
 
+    access_token = tokens.get("cookies", {}).get("api_access_token", "")
+    payload = _decode_jwt_payload(access_token)
+    exp = payload.get("exp") if payload else None
+    if not exp:
+        return None
+    return datetime.fromtimestamp(exp, timezone.utc)
+
+
+def _read_token_cache() -> dict | None:
+    """Read cached tokens without applying validity checks."""
+    if not os.path.exists(TOKEN_CACHE_PATH):
+        return None
+
+    try:
+        with open(TOKEN_CACHE_PATH, "r") as f:
+            return json.load(f)
     except Exception as e:
         logger.warning(f"Could not load cached tokens: {e}")
         return None
+
+
+def inspect_token_cache() -> dict:
+    """Return safe metadata about the local token cache without exposing secrets."""
+    browser_profile_path = get_browser_profile_path()
+    browser_profile_exists = os.path.isdir(browser_profile_path)
+    tokens = _read_token_cache()
+    if not tokens:
+        return {
+            "exists": False,
+            "path": TOKEN_CACHE_PATH,
+            "browser_profile_path": browser_profile_path,
+            "browser_profile_exists": browser_profile_exists,
+        }
+
+    cookies = tokens.get("cookies", {})
+    expires_at = get_access_token_expiry(tokens)
+    seconds_remaining = None
+    if expires_at:
+        seconds_remaining = int((expires_at - datetime.now(timezone.utc)).total_seconds())
+
+    present_required = [name for name in REQUIRED_COOKIES if cookies.get(name)]
+    missing_required = [name for name in REQUIRED_COOKIES if not cookies.get(name)]
+
+    return {
+        "exists": True,
+        "path": TOKEN_CACHE_PATH,
+        "browser_profile_path": tokens.get("browser_profile_path", browser_profile_path),
+        "browser_profile_exists": browser_profile_exists,
+        "my_user_id": tokens.get("my_user_id"),
+        "cookie_count": len(cookies),
+        "cookie_jar_count": len(tokens.get("cookie_jar") or []),
+        "access_token_present": bool(cookies.get("api_access_token")),
+        "access_token_expires_at": expires_at.isoformat() if expires_at else None,
+        "access_token_seconds_remaining": seconds_remaining,
+        "valid_for_startup": seconds_remaining is not None and seconds_remaining > 300,
+        "api_refresh_token_present": bool(cookies.get("api_refresh_token")),
+        "required_cookies_present": present_required,
+        "required_cookies_missing": missing_required,
+    }
+
+
+def load_cached_tokens(allow_expired: bool = False) -> dict | None:
+    """Load tokens from cache file if they exist and are still valid."""
+    tokens = _read_token_cache()
+    if not tokens:
+        return None
+
+    if allow_expired:
+        return tokens
+
+    expires_at = get_access_token_expiry(tokens)
+    if not expires_at:
+        return None
+
+    if time.time() > expires_at.timestamp() - 300:  # 5 minute buffer
+        logger.info("Cached tokens expired. Need fresh login.")
+        return None
+
+    return tokens
+
+
+def _load_cached_tokens() -> dict | None:
+    """Backward-compatible wrapper for valid cached tokens."""
+    return load_cached_tokens()
 
 
 def _save_cached_tokens(tokens: dict) -> None:
@@ -478,25 +701,11 @@ def restore_browser_session(playwright_instance, tokens: dict, settings=None):
     which properly handles Cloudflare and all cookie/header requirements.
     """
     browser = playwright_instance.chromium.launch(headless=True)
-    context = browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/146.0.0.0 Safari/537.36"
-        )
-    )
+    context = browser.new_context(user_agent=USER_AGENT)
 
-    # Inject all cookies into the browser context
-    cookies = tokens.get("cookies", {})
-    cookie_list = []
-    for name, value in cookies.items():
-        cookie_list.append({
-            "name": name,
-            "value": value,
-            "domain": "tigernet.princeton.edu",
-            "path": "/",
-        })
-
+    # Inject cached cookies. New token caches include a full Playwright cookie
+    # jar; legacy caches only have name/value pairs for TigerNet.
+    cookie_list = _cookies_for_context(tokens)
     if cookie_list:
         context.add_cookies(cookie_list)
         logger.info(f"Injected {len(cookie_list)} cookies into browser context.")
