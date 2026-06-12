@@ -63,6 +63,18 @@ def parse_args():
     work.add_argument("--lease-seconds", type=int, default=900)
     work.add_argument("--headless", action="store_true")
     work.add_argument("--raw-root", default="output/raw")
+    work.add_argument(
+        "--max-auth-refreshes",
+        type=int,
+        default=12,
+        help="Maximum automatic TigerNet auth refreshes before stopping",
+    )
+    work.add_argument(
+        "--auth-refresh-delay",
+        type=float,
+        default=30.0,
+        help="Seconds to wait before each automatic TigerNet auth refresh",
+    )
 
     status = subparsers.add_parser(
         "status",
@@ -170,6 +182,8 @@ def run_production_command(args) -> None:
             lease_seconds=args.lease_seconds,
             headless=args.headless,
             raw_root=args.raw_root,
+            max_auth_refreshes=args.max_auth_refreshes,
+            auth_refresh_delay=args.auth_refresh_delay,
         )
         pprint.pp(result)
         return

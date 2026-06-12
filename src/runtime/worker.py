@@ -5,11 +5,19 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import subprocess
+import sys
 import time
 import uuid
 
 from config.settings import Settings
-from src.auth import AuthExpiredError, authenticate, get_access_token_expiry, restore_browser_session
+from src.auth import (
+    AuthExpiredError,
+    authenticate,
+    get_access_token_expiry,
+    load_cached_tokens,
+    restore_browser_session,
+)
 from src.schools import get_adapter
 from src.scraper import _api_fetch
 from src.storage.db import connection, ensure_schema
@@ -29,6 +37,8 @@ def work_school(
     lease_seconds: int = 900,
     headless: bool = True,
     raw_root: str = "output/raw",
+    max_auth_refreshes: int = 12,
+    auth_refresh_delay: float = 30.0,
 ) -> dict:
     """Process profile_jobs from the durable queue."""
     adapter = get_adapter(school_slug)
@@ -76,6 +86,7 @@ def work_school(
         errors = 0
         auth_required = False
         auth_error = None
+        auth_refreshes = 0
         stop_reason = "max_jobs_reached" if max_jobs is not None else "queue_empty"
         consecutive_empty_claims = 0
         my_user_id = tokens["my_user_id"]
@@ -90,8 +101,10 @@ def work_school(
                     hostname=socket.gethostname(),
                 )
 
-                while max_jobs is None or completed < max_jobs:
-                    remaining_capacity = None if max_jobs is None else max_jobs - completed
+                while max_jobs is None or (completed + errors) < max_jobs:
+                    remaining_capacity = (
+                        None if max_jobs is None else max_jobs - completed - errors
+                    )
                     claim_limit = batch_size if remaining_capacity is None else min(batch_size, remaining_capacity)
                     jobs = repo.claim_jobs(
                         run_id=run["id"],
@@ -117,7 +130,7 @@ def work_school(
 
                     consecutive_empty_claims = 0
                     for job_index, job in enumerate(jobs):
-                        if max_jobs is not None and completed >= max_jobs:
+                        if max_jobs is not None and (completed + errors) >= max_jobs:
                             break
                         try:
                             repo.heartbeat(
@@ -146,11 +159,9 @@ def work_school(
                                 completed,
                             )
                         except AuthExpiredError as exc:
-                            auth_required = True
                             auth_error = str(exc)
-                            stop_reason = "auth_required"
                             logger.warning(
-                                "Authentication is required; releasing leased jobs and stopping worker: %s",
+                                "Authentication failed; releasing leased jobs before refresh: %s",
                                 auth_error,
                             )
                             for leased_job in jobs[job_index:]:
@@ -159,9 +170,36 @@ def work_school(
                                     error_code=exc.__class__.__name__,
                                     error_message=auth_error,
                                 )
+
+                            if auth_refreshes >= max_auth_refreshes:
+                                auth_required = True
+                                stop_reason = "auth_required"
+                                logger.error(
+                                    "Automatic auth refresh limit reached (%s).",
+                                    max_auth_refreshes,
+                                )
+                                repo.record_auth_session(
+                                    account_id=account["id"],
+                                    status="auth_required",
+                                    token_expires_at=get_access_token_expiry(tokens),
+                                    failure_reason=auth_error,
+                                    browser_profile_path=tokens.get("browser_profile_path"),
+                                )
+                                repo.heartbeat(
+                                    worker_id=worker_id,
+                                    run_id=run["id"],
+                                    status="auth_required",
+                                    hostname=socket.gethostname(),
+                                    current_job_id=job["id"],
+                                    completed_count=completed,
+                                    error_count=errors,
+                                )
+                                break
+
+                            auth_refreshes += 1
                             repo.record_auth_session(
                                 account_id=account["id"],
-                                status="auth_required",
+                                status="refreshing",
                                 token_expires_at=get_access_token_expiry(tokens),
                                 failure_reason=auth_error,
                                 browser_profile_path=tokens.get("browser_profile_path"),
@@ -169,11 +207,76 @@ def work_school(
                             repo.heartbeat(
                                 worker_id=worker_id,
                                 run_id=run["id"],
-                                status="auth_required",
+                                status="refreshing_auth",
                                 hostname=socket.gethostname(),
                                 current_job_id=job["id"],
                                 completed_count=completed,
                                 error_count=errors,
+                            )
+                            logger.info(
+                                "Attempting automatic TigerNet auth refresh %s/%s.",
+                                auth_refreshes,
+                                max_auth_refreshes,
+                            )
+                            if auth_refresh_delay > 0:
+                                time.sleep(auth_refresh_delay)
+                            _close_browser(browser)
+                            try:
+                                refreshed_tokens = _refresh_tokens_in_subprocess(
+                                    headless=headless,
+                                )
+                                if not refreshed_tokens:
+                                    raise RuntimeError(
+                                        "automatic auth refresh returned no tokens"
+                                    )
+                                tokens = refreshed_tokens
+                                my_user_id = tokens["my_user_id"]
+                                browser, page = restore_browser_session(
+                                    p,
+                                    tokens,
+                                    settings,
+                                )
+                            except Exception as refresh_exc:
+                                auth_required = True
+                                stop_reason = "auth_required"
+                                auth_error = f"automatic auth refresh failed: {refresh_exc}"
+                                logger.error(auth_error)
+                                repo.record_auth_session(
+                                    account_id=account["id"],
+                                    status="auth_required",
+                                    token_expires_at=None,
+                                    failure_reason=auth_error,
+                                    browser_profile_path=tokens.get("browser_profile_path"),
+                                )
+                                repo.heartbeat(
+                                    worker_id=worker_id,
+                                    run_id=run["id"],
+                                    status="auth_required",
+                                    hostname=socket.gethostname(),
+                                    current_job_id=job["id"],
+                                    completed_count=completed,
+                                    error_count=errors,
+                                )
+                                break
+
+                            repo.record_auth_session(
+                                account_id=account["id"],
+                                status="active",
+                                token_expires_at=get_access_token_expiry(tokens),
+                                browser_profile_path=tokens.get("browser_profile_path"),
+                            )
+                            auth_error = None
+                            consecutive_empty_claims = 0
+                            repo.heartbeat(
+                                worker_id=worker_id,
+                                run_id=run["id"],
+                                status="running",
+                                hostname=socket.gethostname(),
+                                completed_count=completed,
+                                error_count=errors,
+                            )
+                            logger.info(
+                                "Automatic auth refresh succeeded; resuming queue work."
                             )
                             break
                         except Exception as exc:
@@ -199,7 +302,7 @@ def work_school(
                     completed_count=completed,
                     error_count=errors,
                 )
-                browser.close()
+                _close_browser(browser)
 
     return {
         "run_id": run["id"],
@@ -207,9 +310,36 @@ def work_school(
         "completed": completed,
         "errors": errors,
         "auth_required": auth_required,
+        "auth_refreshes": auth_refreshes,
         "stop_reason": stop_reason,
         "auth_error": auth_error,
     }
+
+
+def _close_browser(browser) -> None:
+    try:
+        browser.close()
+    except Exception:
+        pass
+
+
+def _refresh_tokens_in_subprocess(headless: bool) -> dict | None:
+    """Refresh auth without nesting Playwright's sync driver in this process."""
+    script = (
+        "from src.utils import setup_logging; "
+        "from src.auth import refresh_tokens; "
+        "setup_logging(); "
+        f"tokens = refresh_tokens(headless={headless!r}); "
+        "raise SystemExit(0 if tokens else 1)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=os.getcwd(),
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return load_cached_tokens()
 
 
 def _process_job(
@@ -237,6 +367,10 @@ def _process_job(
     )
 
     if not full_raw and not data_raw:
+        if not _auth_probe_succeeded(adapter, page):
+            raise AuthExpiredError(
+                "TigerNet profile endpoints and directory auth probe failed"
+            )
         raise RuntimeError("Both profile endpoints failed or returned no data.")
 
     full_profile = None
@@ -270,4 +404,13 @@ def _process_job(
         data_payload_ref=data_ref,
     )
     repo.mark_job_complete(job["id"])
+
+
+def _auth_probe_succeeded(adapter, page) -> bool:
+    probe = _api_fetch(page, adapter.build_listing_url(page=1, per_page=1), max_retries=1)
+    if not isinstance(probe, dict):
+        return False
+    if adapter.extract_total_users(probe) is not None:
+        return True
+    return bool(adapter.extract_listing_users(probe))
 

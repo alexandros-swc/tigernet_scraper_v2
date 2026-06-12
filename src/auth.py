@@ -166,6 +166,24 @@ def _browser_login(headless: bool) -> dict | None:
                     continue
 
             if not login_clicked and not already_authenticated:
+                # The persistent profile can be authenticated even when the
+                # public landing page does not show a Login button in headless
+                # mode. Try the authenticated app route before forcing CAS.
+                logger.info("Login button not found. Trying authenticated homepage...")
+                try:
+                    page.goto(
+                        "https://tigernet.princeton.edu/my-homepage",
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                    if _wait_for_api_session(page, timeout_seconds=15):
+                        already_authenticated = True
+                        login_clicked = True
+                        logger.info("Authenticated homepage restored the TigerNet session.")
+                except Exception as e:
+                    logger.warning(f"Authenticated homepage fallback failed: {e}")
+
+            if not login_clicked and not already_authenticated:
                 # Last resort: navigate directly to CAS login URL
                 logger.info("Login button not found. Navigating directly to CAS...")
                 page.goto(
@@ -198,6 +216,17 @@ def _browser_login(headless: bool) -> dict | None:
                     "CAS form did not appear. Waiting for existing SSO/Duo "
                     "session or remembered-device redirect."
                 )
+                try:
+                    page.goto(
+                        "https://tigernet.princeton.edu/my-homepage",
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                    if _wait_for_api_session(page, timeout_seconds=15):
+                        auth_state = "authenticated"
+                        logger.info("Authenticated homepage restored the TigerNet session.")
+                except Exception as e:
+                    logger.warning(f"Authenticated homepage fallback failed: {e}")
 
             if auth_state != "authenticated":
                 if not _wait_for_authenticated(page, timeout_seconds=120):
