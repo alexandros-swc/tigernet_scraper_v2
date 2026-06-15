@@ -13,6 +13,13 @@ import time
 import uuid
 from urllib.parse import urlparse
 
+from src.columbia.api import (
+    coveo_search,
+    extract_coveo_rows,
+    extract_linkedin_from_salesforce_fields,
+    fetch_salesforce_user_fields,
+    total_count,
+)
 from src.columbia.adapter import ColumbiaAdapter
 from src.columbia.auth import (
     ColumbiaAuthRequiredError,
@@ -56,12 +63,17 @@ def auth_check(headless: bool = True, login_if_needed: bool = False, api_check: 
     with sync_playwright() as p:
         browser, page = _restore_or_refresh_session(p, tokens, headless=headless)
         try:
-            rows = _extract_visible_search_results(page, count=1)
+            payload = coveo_search(page, first_result=0, number_of_results=1)
+            rows = extract_coveo_rows(payload, source_page=1, per_page=1) if payload else []
+            extraction_method = "coveo_api" if rows else "ui"
+            if not rows:
+                rows = _extract_visible_search_results(page, count=1)
             result["api_check"] = {
                 "status": "ok" if rows else "failed",
                 "current_url": page.url,
                 "visible_results": len(rows),
                 "first_result": rows[0] if rows else None,
+                "extraction_method": extraction_method,
             }
         finally:
             browser.close()
@@ -97,52 +109,33 @@ def seed(
         with sync_playwright() as p:
             browser, page = _restore_or_refresh_session(p, tokens, headless=headless)
             try:
-                if per_page:
-                    _set_results_per_page(page, per_page)
-
-                page_number = 1
-                pages_seen = 0
-                while True:
-                    rows = _extract_visible_search_results(page, count=per_page or 100)
-                    if not rows:
-                        raise ColumbiaAuthExpiredError(
-                            "Columbia search results were not visible during seed"
-                        )
-                    for row in rows:
-                        row["source_page"] = page_number
-                        row["result_page_url"] = page.url
-                        row["external_id"] = _external_id_for_row(row)
-
-                    raw_store.put_json(
-                        f"{adapter.slug}/run_{run['id']}/listing/page_{page_number}.json.gz",
-                        {"page": page_number, "url": page.url, "rows": rows},
+                page_size = per_page or 100
+                try:
+                    pages_seen, total_seeded, total_jobs = _seed_from_coveo_api(
+                        repo=repo,
+                        raw_store=raw_store,
+                        adapter=adapter,
+                        page=page,
+                        run=run,
+                        school=school,
+                        per_page=page_size,
+                        max_pages=max_pages,
                     )
-                    for row in rows:
-                        external_user_id = row["external_id"]
-                        repo.upsert_seed_user(
-                            school_id=school["id"],
-                            external_user_id=external_user_id,
-                            listing_payload=row,
-                            full_name=row.get("full_name"),
-                            class_year=row.get("class_tag"),
-                            source_page=page_number,
-                        )
-                        repo.enqueue_profile_job(run["id"], school["id"], external_user_id)
-                        total_seeded += 1
-                        total_jobs += 1
-
-                    pages_seen += 1
-                    logger.info(
-                        "Seeded Columbia page %s: %s visible results",
-                        page_number,
-                        len(rows),
+                except Exception as exc:
+                    logger.warning(
+                        "Columbia Coveo API seed failed; falling back to rendered UI extraction: %s",
+                        exc,
                     )
-                    if max_pages is not None and pages_seen >= max_pages:
-                        break
-                    if not _go_to_next_results_page(page, page_number):
-                        break
-                    page_number += 1
-                    time.sleep(0.5)
+                    pages_seen, total_seeded, total_jobs = _seed_from_rendered_ui(
+                        repo=repo,
+                        raw_store=raw_store,
+                        adapter=adapter,
+                        page=page,
+                        run=run,
+                        school=school,
+                        per_page=page_size,
+                        max_pages=max_pages,
+                    )
             finally:
                 browser.close()
 
@@ -315,7 +308,10 @@ def smoke(count: int = 3, headless: bool = True, output_path: str = "output/colu
     with sync_playwright() as p:
         browser, page = _restore_or_refresh_session(p, tokens, headless=headless)
         try:
-            rows = _extract_visible_search_results(page, count=count)
+            payload = coveo_search(page, first_result=0, number_of_results=count)
+            rows = extract_coveo_rows(payload, source_page=1, per_page=count) if payload else []
+            if not rows:
+                rows = _extract_visible_search_results(page, count=count)
             _enrich_rows_from_profiles(page, rows)
         finally:
             browser.close()
@@ -351,6 +347,155 @@ def export_db(
     return export_results_to_csv(output_path, ColumbiaAdapter.slug, database_url=database_url, run_id=run_id)
 
 
+def _seed_from_coveo_api(
+    repo: ScrapeRepository,
+    raw_store: RawStore,
+    adapter: ColumbiaAdapter,
+    page,
+    run: dict,
+    school: dict,
+    per_page: int,
+    max_pages: int | None,
+) -> tuple[int, int, int]:
+    page_size = max(1, min(per_page, 100))
+    page_number = 1
+    pages_seen = 0
+    total_seeded = 0
+    total_jobs = 0
+    total_available: int | None = None
+
+    while True:
+        first_result = (page_number - 1) * page_size
+        payload = coveo_search(
+            page,
+            first_result=first_result,
+            number_of_results=page_size,
+        )
+        if not payload:
+            if pages_seen == 0:
+                raise RuntimeError("Columbia Coveo API returned no payload during seed")
+            break
+
+        rows = extract_coveo_rows(payload, source_page=page_number, per_page=page_size)
+        total_available = total_available if total_available is not None else total_count(payload)
+        if not rows:
+            if pages_seen == 0:
+                raise RuntimeError("Columbia Coveo API returned no alumni rows during seed")
+            break
+
+        raw_store.put_json(
+            f"{adapter.slug}/run_{run['id']}/listing/page_{page_number}.json.gz",
+            {
+                "page": page_number,
+                "first_result": first_result,
+                "per_page": page_size,
+                "total_available": total_available,
+                "extraction_method": "coveo_api",
+                "payload": payload,
+                "rows": rows,
+            },
+        )
+        for row in rows:
+            external_user_id = row.get("external_id") or _external_id_for_row(row)
+            row["external_id"] = str(external_user_id)
+            repo.upsert_seed_user(
+                school_id=school["id"],
+                external_user_id=str(external_user_id),
+                listing_payload=row,
+                full_name=row.get("full_name"),
+                class_year=row.get("class_tag"),
+                source_page=page_number,
+            )
+            repo.enqueue_profile_job(run["id"], school["id"], str(external_user_id))
+            total_seeded += 1
+            total_jobs += 1
+
+        pages_seen += 1
+        logger.info(
+            "Seeded Columbia page %s from Coveo API: %s results",
+            page_number,
+            len(rows),
+        )
+        if max_pages is not None and pages_seen >= max_pages:
+            break
+        if total_available is not None and first_result + len(rows) >= total_available:
+            break
+        page_number += 1
+        time.sleep(0.2)
+
+    return pages_seen, total_seeded, total_jobs
+
+
+def _seed_from_rendered_ui(
+    repo: ScrapeRepository,
+    raw_store: RawStore,
+    adapter: ColumbiaAdapter,
+    page,
+    run: dict,
+    school: dict,
+    per_page: int,
+    max_pages: int | None,
+) -> tuple[int, int, int]:
+    page.goto(get_start_url(), wait_until="domcontentloaded", timeout=30000)
+    time.sleep(2)
+    if per_page:
+        _set_results_per_page(page, per_page)
+
+    page_number = 1
+    pages_seen = 0
+    total_seeded = 0
+    total_jobs = 0
+    while True:
+        rows = _extract_visible_search_results(page, count=per_page or 100)
+        if not rows:
+            raise ColumbiaAuthExpiredError(
+                "Columbia search results were not visible during seed"
+            )
+        for row in rows:
+            row["source_page"] = page_number
+            row["result_page_url"] = page.url
+            row["extraction_method"] = "rendered_ui"
+            row["external_id"] = _external_id_for_row(row)
+
+        raw_store.put_json(
+            f"{adapter.slug}/run_{run['id']}/listing/page_{page_number}.json.gz",
+            {
+                "page": page_number,
+                "url": page.url,
+                "extraction_method": "rendered_ui",
+                "rows": rows,
+            },
+        )
+        for row in rows:
+            external_user_id = row["external_id"]
+            repo.upsert_seed_user(
+                school_id=school["id"],
+                external_user_id=external_user_id,
+                listing_payload=row,
+                full_name=row.get("full_name"),
+                class_year=row.get("class_tag"),
+                source_page=page_number,
+            )
+            repo.enqueue_profile_job(run["id"], school["id"], external_user_id)
+            total_seeded += 1
+            total_jobs += 1
+
+        pages_seen += 1
+        logger.info(
+            "Seeded Columbia page %s from rendered UI: %s visible results",
+            page_number,
+            len(rows),
+        )
+        if max_pages is not None and pages_seen >= max_pages:
+            break
+        if not _go_to_next_results_page(page, page_number):
+            break
+        page_number += 1
+        time.sleep(0.5)
+
+    return pages_seen, total_seeded, total_jobs
+
+
 def _process_job(
     repo: ScrapeRepository,
     raw_store: RawStore,
@@ -364,6 +509,10 @@ def _process_job(
     listing_payload = repo.get_seed_payload(school_id, external_user_id)
     if not listing_payload:
         raise RuntimeError(f"Missing Columbia seed payload for {external_user_id}")
+
+    if listing_payload.get("extraction_method") == "coveo_api":
+        _process_coveo_job(repo, raw_store, adapter, page, run_id, school_id, job, listing_payload)
+        return
 
     target_page = int(listing_payload.get("source_page") or 1)
     _go_to_results_page(page, target_page)
@@ -417,10 +566,92 @@ def _process_job(
     _return_to_results(page, listing_payload.get("result_page_url") or page.url)
 
 
+def _process_coveo_job(
+    repo: ScrapeRepository,
+    raw_store: RawStore,
+    adapter: ColumbiaAdapter,
+    page,
+    run_id: int,
+    school_id: int,
+    job: dict,
+    listing_payload: dict,
+) -> None:
+    external_user_id = job["external_user_id"]
+    row = dict(listing_payload)
+    row["profile_extraction_method"] = "coveo_api"
+    salesforce_payload = None
+
+    if not row.get("linkedin_profile_url") and row.get("salesforce_user_id"):
+        salesforce_payload = fetch_salesforce_user_fields(page, row["salesforce_user_id"])
+        api_linkedin_fields = extract_linkedin_from_salesforce_fields(salesforce_payload)
+        if api_linkedin_fields.get("linkedin_profile_url"):
+            api_linkedin_fields["linkedin_extraction_method"] = "salesforce_ui_api"
+        row.update(api_linkedin_fields)
+
+    if not row.get("linkedin_profile_url"):
+        linkedin_url = _try_linkedin_from_profile_ui(page, row)
+        if linkedin_url:
+            row["linkedin_profile_url"] = linkedin_url
+            row["linkedin_extraction_method"] = "profile_ui_click"
+
+    profile_ref = raw_store.put_json(
+        f"{adapter.slug}/run_{run_id}/profiles/{external_user_id}/profile.json.gz",
+        {
+            "listing": listing_payload,
+            "profile": row,
+            "extraction_method": "coveo_api",
+            "salesforce_user_fields": salesforce_payload,
+        },
+    )
+
+    repo.upsert_profile_result(
+        run_id=run_id,
+        school_id=school_id,
+        external_user_id=external_user_id,
+        normalized_json=row,
+        profile_payload_ref=profile_ref,
+        data_payload_ref=None,
+        parser_version="coveo_api_v1",
+    )
+    repo.mark_job_complete(job["id"])
+
+
+def _try_linkedin_from_profile_ui(page, row: dict) -> str:
+    """Fallback for LinkedIn URLs that are only exposed by the profile icon."""
+    name = row.get("full_name", "")
+    if not name:
+        return ""
+    original_url = page.url
+    try:
+        opened = _open_profile_for_row(page, row)
+        if not opened:
+            row["linkedin_ui_fallback_error"] = "could_not_open_profile_for_linkedin"
+            return ""
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+        time.sleep(1)
+        details = _extract_profile_details(page)
+        linkedin_url = details.get("linkedin_profile_url") or _click_profile_linkedin_button(page, name)
+        return linkedin_url or ""
+    except Exception as exc:
+        logger.warning("Could not extract Columbia LinkedIn URL from profile UI for %s: %s", name, exc)
+        row["linkedin_ui_fallback_error"] = str(exc)
+        return ""
+    finally:
+        try:
+            if page.url != original_url:
+                page.goto(original_url, wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            pass
+
+
 def _auth_probe_succeeded(adapter: ColumbiaAdapter, page) -> bool:
-    probe = api_fetch(page, adapter.build_listing_url(1, 1), max_retries=1)
-    return isinstance(probe, dict) and (
-        adapter.extract_total_users(probe) is not None or bool(adapter.extract_listing_users(probe))
+    probe = coveo_search(page, first_result=0, number_of_results=1, max_retries=1)
+    if isinstance(probe, dict) and extract_coveo_rows(probe, source_page=1, per_page=1):
+        return True
+    legacy_probe = api_fetch(page, adapter.build_listing_url(1, 1), max_retries=1)
+    return isinstance(legacy_probe, dict) and (
+        adapter.extract_total_users(legacy_probe) is not None
+        or bool(adapter.extract_listing_users(legacy_probe))
     )
 
 
@@ -467,8 +698,19 @@ def _write_csv(output_path: str, rows: list[dict]) -> None:
         "country",
         "class_tag",
         "linkedin_profile_url",
+        "linkedin_extraction_method",
+        "linkedin_visibility",
+        "linkedin_url_updated",
+        "social_links_private",
+        "social_media_account_visibility",
         "profile_url",
         "profile_open_error",
+        "salesforce_user_id",
+        "permanent_id",
+        "current_title",
+        "current_company",
+        "industry",
+        "headline",
     ]
     ordered = [field for field in priority if field in fieldnames]
     ordered.extend(field for field in fieldnames if field not in set(ordered))

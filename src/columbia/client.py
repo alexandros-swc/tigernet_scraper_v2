@@ -1,4 +1,4 @@
-"""Browser-context API helper for Columbia's Hivebrite directory."""
+"""Browser-context API helper for Columbia's Salesforce community directory."""
 
 from __future__ import annotations
 

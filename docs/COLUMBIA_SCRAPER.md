@@ -48,15 +48,19 @@ only when Columbia CAS/Duo still trusts the remembered device; if Duo requires
 a fresh phone approval, run without `--headless` once so you can approve it and
 preserve the remembered browser state.
 
-The DB-backed Columbia path is Salesforce UI-driven:
+The DB-backed Columbia path is API-first after login:
 
-- `seed` opens the global search page, captures visible alumni result rows,
-  stores them in `alumni_seed`, and enqueues `profile_jobs`.
-- `work` claims queued jobs, navigates back to the saved result page number,
-  opens each profile, captures profile details and the personal LinkedIn URL
-  when available, and writes normalized rows to `profile_results`.
+- `seed` opens the global search page to obtain an authenticated browser
+  session, then calls Columbia's Coveo search endpoint from that browser
+  context. It stores API rows in `alumni_seed` and enqueues `profile_jobs`.
+- `work` claims queued jobs and writes the normalized Coveo/Salesforce fields
+  to `profile_results`.
+- For LinkedIn, `work` first checks Coveo raw fields, then fetches the
+  Salesforce UI API record fields `LinkedIn_Profile_URL__c`,
+  `LinkedIn_Profile_Link__c`, and related visibility fields. If those API
+  fields do not expose a personal `/in/` URL, it falls back to the already
+  proven profile-icon click/intercept path.
 - `export-db` writes completed normalized rows to CSV.
 
-Unlike TigerNet, Columbia does not currently expose a clean Hivebrite listing
-API here, so pagination is driven by clicking the Salesforce community result
-controls.
+The old rendered-search extraction remains as a fallback if the Coveo API is
+unavailable during a run. Login is still UI-based through Columbia CAS/Duo.

@@ -1,4 +1,4 @@
-"""Columbia Hivebrite response adapter and normalizer."""
+"""Columbia Salesforce/Coveo response adapter and normalizer."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import os
 
 class ColumbiaAdapter:
     slug = "columbia"
-    platform = "hivebrite"
+    platform = "salesforce_coveo"
 
     def __init__(self, base_url: str | None = None):
         self.base_url = (base_url or os.getenv("COLUMBIA_BASE_URL") or "https://community.alumni.columbia.edu").rstrip("/")
